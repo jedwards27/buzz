@@ -228,15 +228,38 @@ class JourneyTests(unittest.TestCase):
             review_native.fixture_environment(
                 review_native.isolation_manifest("run", "ws://127.0.0.1:3001"), "a" * 64)
 
+    def test_fixture_environment_uses_cleanup_mode_without_seed_variable(self):
+        isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
+        environment = review_native.fixture_environment(isolation, "a" * 64, cleanup=True)
+        self.assertEqual(environment["BUZZ_REVIEW_CLEANUP_PUBKEY"], "a" * 64)
+        self.assertNotIn("BUZZ_REVIEW_PUBKEY", environment)
+
+    def test_cleanup_attempts_database_principal_and_secret_removal_after_reset_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            secret_path = run_dir / "state/identity.key"
+            secret_path.parent.mkdir()
+            secret_path.write_text("review-secret")
+            isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
+            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
+            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]) as run:
+                with self.assertRaisesRegex(review_native.HarnessError, "desktop state reset failed"):
+                    review_native.cleanup_review_state(run_dir, isolation, fixture)
+            cleanup_env = run.call_args_list[1].kwargs["env"]
+            self.assertEqual(cleanup_env["BUZZ_REVIEW_CLEANUP_PUBKEY"], "a" * 64)
+            self.assertFalse(secret_path.exists())
+
     def test_fixture_seed_failure_removes_generated_identity(self):
         generated = mock.Mock(stdout=f"Secret key: {'1' * 64}\nPublic key: {'2' * 64}\n")
         with tempfile.TemporaryDirectory() as directory:
             run_dir = pathlib.Path(directory)
             (run_dir / "manifest").mkdir()
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            with mock.patch.object(review_native, "run", side_effect=[generated, RuntimeError("seed failed")]):
-                with self.assertRaisesRegex(RuntimeError, "seed failed"):
+            with mock.patch.object(review_native, "run", side_effect=[mock.Mock(), generated, RuntimeError("seed failed"), mock.Mock()]) as run:
+                with self.assertRaisesRegex(review_native.HarnessError, "fixture seed failed: seed failed"):
                     review_native.prepare_fixture(run_dir, isolation)
+            self.assertEqual(run.call_count, 4)
+            self.assertEqual(run.call_args_list[3].kwargs["env"]["BUZZ_REVIEW_CLEANUP_PUBKEY"], "2" * 64)
             self.assertFalse((run_dir / "state/identity.key").exists())
 
     def test_run_scrubs_repository_controlled_commands_by_default(self):
@@ -267,8 +290,8 @@ class JourneyTests(unittest.TestCase):
             secret_path.parent.mkdir()
             secret_path.write_text("review-secret")
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            fixture = {"secret_path": str(secret_path)}
-            with mock.patch.object(review_native, "run", side_effect=RuntimeError("reset failed")):
+            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
+            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]):
                 with self.assertRaisesRegex(
                         review_native.HarnessError,
                         "desktop state reset failed: reset failed"):
@@ -280,8 +303,8 @@ class JourneyTests(unittest.TestCase):
             run_dir = pathlib.Path(directory)
             secret_path = run_dir / "state/identity.key"
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            fixture = {"secret_path": str(secret_path)}
-            with mock.patch.object(review_native, "run", side_effect=RuntimeError("reset failed")), \
+            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
+            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]), \
                  mock.patch.object(pathlib.Path, "unlink", side_effect=OSError("unlink failed")):
                 with self.assertRaisesRegex(
                         review_native.HarnessError,
@@ -535,6 +558,7 @@ class PublishReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(review_native.PublishError, "digest does not match"):
                 review_native.publish_review(receipt, summary, "channel", "thread")
 
+
     @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
     def test_rejects_dirty_receipt_before_upload(self, _which):
         with tempfile.TemporaryDirectory() as directory:
@@ -545,6 +569,13 @@ class PublishReviewTests(unittest.TestCase):
             receipt.write_text(json.dumps(payload))
             with self.assertRaisesRegex(review_native.PublishError, "clean source"):
                 review_native.publish_review(receipt, summary, "channel", "thread")
+
+
+class MeasurementTests(unittest.TestCase):
+    def test_failed_step_does_not_produce_measurement(self):
+        self.assertIsNone(review_native.valid_measurement("failed", 5000))
+        self.assertEqual(review_native.valid_measurement("passed", 250), 250)
+
 
 
 if __name__ == "__main__":
