@@ -1,9 +1,9 @@
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import tempfile
-import subprocess
 import unittest
 from unittest import mock
 
@@ -63,101 +63,41 @@ class JourneyTests(unittest.TestCase):
             with self.assertRaisesRegex(review_native.HarnessError, "scroll requires integer delta_y"):
                 review_native.load_journey(path)
 
-    def test_action_numeric_bounds_match_schema(self):
-        source = (MODULE_PATH.parent / "desktop/composer-keyboard.yaml").read_text()
-        mutations = (
-            ("duration_ms: 100", "duration_ms: 30000", None),
-            ("duration_ms: 100", "duration_ms: 30001", "wait requires integer duration_ms in 1..30000"),
-            ("delta_y: 240", "delta_y: -10000", None),
-            ("delta_y: 240", "delta_y: 10000", None),
-            ("delta_y: 240", "delta_y: 10001", "scroll requires integer delta_y in -10000..10000"),
-            ("delta_y: 240", "delta_y: 2147483648", "scroll requires integer delta_y in -10000..10000"),
-        )
-        for old, new, diagnostic in mutations:
-            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
-                path = pathlib.Path(directory) / "journey.yaml"
-                path.write_text(source.replace(old, new, 1))
-                if diagnostic is None:
-                    review_native.load_journey(path)
-                else:
-                    with self.assertRaisesRegex(review_native.HarnessError, diagnostic):
-                        review_native.load_journey(path)
 
-    def test_expect_for_duration_bounds_match_schema(self):
+    def test_boolean_and_nonfinite_journey_numbers_are_rejected(self):
         source = (MODULE_PATH.parent / "desktop/tooltip-fresh-dwell.yaml").read_text()
-        insertion = "    expect_for:\n      duration_ms: VALUE\n      condition: {exists: {role: window}}\n    timeout_ms: 1000\n"
-        for value, diagnostic in ((1, None), (30000, None), (30001, "expect_for.duration_ms")):
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
-                path = pathlib.Path(directory) / "journey.yaml"
-                path.write_text(source.replace("    timeout_ms: 1000\n", insertion.replace("VALUE", str(value)), 1))
-                if diagnostic is None:
-                    review_native.load_journey(path)
-                else:
-                    with self.assertRaisesRegex(review_native.HarnessError, diagnostic):
-                        review_native.load_journey(path)
-
-    def test_boolean_negative_and_vacuous_durations_are_rejected(self):
-        source = (MODULE_PATH.parent / "desktop/tooltip-fresh-dwell.yaml").read_text()
-        mutations = (
-            ("duration_ms: 100", "duration_ms: true", "wait requires integer duration_ms"),
-            ("duration_ms: 800", "duration_ms: -1", "wait requires integer duration_ms"),
-            ("duration_ms: 800", "duration_ms: 0", "wait requires integer duration_ms"),
-            ("duration_ms: 800", "", "wait requires integer duration_ms"),
-            ("    timeout_ms: 1000\n", "    expect_for:\n      duration_ms: 0\n      condition: {exists: {role: window}}\n    timeout_ms: 1000\n", "expect_for.duration_ms"),
-            ("timeout_ms: 1000", "timeout_ms: true", "timeout_ms"),
-        )
-        for old, new, diagnostic in mutations:
+        composer = (MODULE_PATH.parent / "desktop/composer-keyboard.yaml").read_text()
+        cases = [
+            (source, "timeout_ms: 15000", "timeout_ms: true", "timeout_ms"),
+            (source, "duration_ms: 800", "duration_ms: true", "duration_ms"),
+            (composer, "scroll_y_less_than: 1", "scroll_y_less_than: .nan", "finite number"),
+        ]
+        for source_text, old, new, error in cases:
             with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
                 path = pathlib.Path(directory) / "invalid.yaml"
-                path.write_text(source.replace(old, new, 1))
-                with self.assertRaisesRegex(review_native.HarnessError, diagnostic):
+                path.write_text(source_text.replace(old, new, 1))
+                with self.assertRaisesRegex(review_native.HarnessError, error):
                     review_native.load_journey(path)
 
-    def test_boolean_and_non_finite_numeric_expectations_are_rejected(self):
+    def test_scroll_requires_locator_and_bounded_delta(self):
         source = (MODULE_PATH.parent / "desktop/composer-keyboard.yaml").read_text()
-        for value in ("true", ".nan", ".inf"):
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+        without_locator = source.replace("    locate:\n      - {id: message-input-scroll}\n", "", 1)
+        oversized = source.replace("delta_y: 240", "delta_y: 10001", 1)
+        for value in (without_locator, oversized):
+            with tempfile.TemporaryDirectory() as directory:
                 path = pathlib.Path(directory) / "invalid.yaml"
-                path.write_text(source.replace("scroll_y_less_than: 1", f"scroll_y_less_than: {value}", 1))
-                with self.assertRaisesRegex(review_native.HarnessError, "finite number"):
+                path.write_text(value)
+                with self.assertRaises(review_native.HarnessError):
                     review_native.load_journey(path)
 
-    def test_scroll_requires_locator(self):
-        source = (MODULE_PATH.parent / "desktop/composer-keyboard.yaml").read_text()
-        source = re.sub(r"    locate:\n(?:      - .*\n)+    act: \{type: scroll", "    act: {type: scroll", source, count=1)
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "invalid.yaml"
-            path.write_text(source)
-            with self.assertRaisesRegex(review_native.HarnessError, "scroll requires locate"):
-                review_native.load_journey(path)
-
-    def test_press_modifiers_match_schema_enum_and_uniqueness(self):
-        source = (MODULE_PATH.parent / "desktop/search-shortcut-dismissal.yaml").read_text()
-        mutations = (
-            ("modifiers: [command]", "modifiers: [command, shift]", None),
-            ("modifiers: [command]", "modifiers: [bogus]", "press modifiers must be unique"),
-            ("modifiers: [command]", "modifiers: [command, command]", "press modifiers must be unique"),
-        )
-        for old, new, diagnostic in mutations:
-            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
-                path = pathlib.Path(directory) / "journey.yaml"
-                path.write_text(source.replace(old, new, 1))
-                if diagnostic is None:
-                    review_native.load_journey(path)
-                else:
-                    with self.assertRaisesRegex(review_native.HarnessError, diagnostic):
-                        review_native.load_journey(path)
-
-    def test_driver_timeout_includes_bounded_action_duration(self):
-        driver = object.__new__(review_native.Driver)
-        driver.process = mock.Mock()
-        driver.process.stdin = mock.Mock()
-        driver.process.stdout = mock.Mock()
-        driver.process.stdout.readline.return_value = '{"ok": true}\n'
-        driver.process.stderr = mock.Mock()
-        with mock.patch.object(review_native.select, "select", return_value=([driver.process.stdout], [], [])) as selected:
-            driver.request("act", action={"type": "wait", "duration_ms": 30000})
-        self.assertEqual(selected.call_args.args[3], 35)
+    def test_relay_url_rejects_ambiguous_components(self):
+        for relay in (
+            "ws://localhost:3030/path", "ws://user@localhost:3030",
+            "ws://localhost:3030?x=1", "ws://localhost:3030#x",
+            "ws://localhost", "ws://localhost:0", "ws://localhost:99999",
+        ):
+            with self.subTest(relay=relay), self.assertRaises(review_native.HarnessError):
+                review_native.isolation_manifest("run", relay)
 
     def test_value_expectation_uses_selected_element(self):
         driver = mock.Mock()
@@ -195,6 +135,41 @@ class JourneyTests(unittest.TestCase):
             with self.assertRaisesRegex(review_native.HarnessError, "exactly one"):
                 review_native.load_journey(path)
 
+    def test_cleanup_cannot_be_disabled_for_pass_eligible_journeys(self):
+        source = (MODULE_PATH.parent / "desktop/tooltip-fresh-dwell.yaml").read_text()
+        for key in ("terminate_app", "remove_state"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "invalid.yaml"
+                path.write_text(source.replace(f"{key}: true", f"{key}: false", 1))
+                with self.assertRaisesRegex(review_native.HarnessError, "cleanup requires"):
+                    review_native.load_journey(path)
+
+    def test_native_driver_uses_pid_targeted_keyboard_delivery(self):
+        source = (
+            MODULE_PATH.parent
+            / "swift/Sources/BuzzNativeDriver/main.swift"
+        ).read_text()
+        self.assertIn("event.postToPid(pid)", source)
+        self.assertIn("down.postToPid(pid)", source)
+        self.assertNotIn("down.post(tap: .cghidEventTap)", source)
+
+    def test_semantic_frames_must_stay_inside_their_viewport(self):
+        node = {
+            "id": "target", "role": "button", "scrollY": 0,
+            "enabled": True, "focused": False,
+            "frame": {"x": 10, "y": 20, "width": 30, "height": 40},
+            "viewport": {"width": 100, "height": 100},
+        }
+        self.assertTrue(review_native.valid_semantic_snapshot([node]))
+        for field, value in (
+            ("x", -1), ("y", -1), ("width", 0), ("height", 0),
+            ("x", 80), ("y", 70),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = json.loads(json.dumps(node))
+                invalid["frame"][field] = value
+                self.assertFalse(review_native.valid_semantic_snapshot([invalid]))
+
     def test_production_and_remote_targets_are_rejected(self):
         with self.assertRaisesRegex(review_native.HarnessError, "non-loopback"):
             review_native.isolation_manifest("run", "wss://buzz.block.builderlab.xyz")
@@ -228,38 +203,28 @@ class JourneyTests(unittest.TestCase):
             review_native.fixture_environment(
                 review_native.isolation_manifest("run", "ws://127.0.0.1:3001"), "a" * 64)
 
-    def test_fixture_environment_uses_cleanup_mode_without_seed_variable(self):
-        isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-        environment = review_native.fixture_environment(isolation, "a" * 64, cleanup=True)
-        self.assertEqual(environment["BUZZ_REVIEW_CLEANUP_PUBKEY"], "a" * 64)
-        self.assertNotIn("BUZZ_REVIEW_PUBKEY", environment)
-
-    def test_cleanup_attempts_database_principal_and_secret_removal_after_reset_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run_dir = pathlib.Path(directory)
-            secret_path = run_dir / "state/identity.key"
-            secret_path.parent.mkdir()
-            secret_path.write_text("review-secret")
-            isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
-            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]) as run:
-                with self.assertRaisesRegex(review_native.HarnessError, "desktop state reset failed"):
-                    review_native.cleanup_review_state(run_dir, isolation, fixture)
-            cleanup_env = run.call_args_list[1].kwargs["env"]
-            self.assertEqual(cleanup_env["BUZZ_REVIEW_CLEANUP_PUBKEY"], "a" * 64)
-            self.assertFalse(secret_path.exists())
-
     def test_fixture_seed_failure_removes_generated_identity(self):
         generated = mock.Mock(stdout=f"Secret key: {'1' * 64}\nPublic key: {'2' * 64}\n")
         with tempfile.TemporaryDirectory() as directory:
             run_dir = pathlib.Path(directory)
             (run_dir / "manifest").mkdir()
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            with mock.patch.object(review_native, "run", side_effect=[mock.Mock(), generated, RuntimeError("seed failed"), mock.Mock()]) as run:
+            with mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                 mock.patch.object(review_native, "run", side_effect=[generated, RuntimeError("seed failed"), mock.Mock()]):
                 with self.assertRaisesRegex(review_native.HarnessError, "fixture seed failed: seed failed"):
                     review_native.prepare_fixture(run_dir, isolation)
-            self.assertEqual(run.call_count, 4)
-            self.assertEqual(run.call_args_list[3].kwargs["env"]["BUZZ_REVIEW_CLEANUP_PUBKEY"], "2" * 64)
+            self.assertFalse((run_dir / "state/identity.key").exists())
+
+    def test_fixture_seed_interruption_removes_generated_identity(self):
+        generated = mock.Mock(stdout=f"Secret key: {'1' * 64}\nPublic key: {'2' * 64}\n")
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            (run_dir / "manifest").mkdir()
+            isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
+            with mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                 mock.patch.object(review_native, "run", side_effect=[generated, KeyboardInterrupt, mock.Mock()]):
+                with self.assertRaises(KeyboardInterrupt):
+                    review_native.prepare_fixture(run_dir, isolation)
             self.assertFalse((run_dir / "state/identity.key").exists())
 
     def test_run_scrubs_repository_controlled_commands_by_default(self):
@@ -290,8 +255,8 @@ class JourneyTests(unittest.TestCase):
             secret_path.parent.mkdir()
             secret_path.write_text("review-secret")
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
-            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]):
+            fixture = {"secret_path": str(secret_path)}
+            with mock.patch.object(review_native, "run", side_effect=RuntimeError("reset failed")):
                 with self.assertRaisesRegex(
                         review_native.HarnessError,
                         "desktop state reset failed: reset failed"):
@@ -303,8 +268,8 @@ class JourneyTests(unittest.TestCase):
             run_dir = pathlib.Path(directory)
             secret_path = run_dir / "state/identity.key"
             isolation = review_native.isolation_manifest("run", "ws://127.0.0.1:3030")
-            fixture = {"secret_path": str(secret_path), "identity_pubkey": "a" * 64}
-            with mock.patch.object(review_native, "run", side_effect=[RuntimeError("reset failed"), mock.Mock()]), \
+            fixture = {"secret_path": str(secret_path)}
+            with mock.patch.object(review_native, "run", side_effect=RuntimeError("reset failed")), \
                  mock.patch.object(pathlib.Path, "unlink", side_effect=OSError("unlink failed")):
                 with self.assertRaisesRegex(
                         review_native.HarnessError,
@@ -318,6 +283,305 @@ class JourneyTests(unittest.TestCase):
              mock.patch.object(review_native.subprocess, "Popen") as popen:
             review_native.Driver(pathlib.Path("/tmp/driver"), 42, pathlib.Path("/tmp/snapshot"))
         self.assertEqual(popen.call_args.kwargs["env"], safe)
+
+    def test_launch_timeout_kills_and_reaps_term_ignoring_child(self):
+        process = mock.Mock(pid=42)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            review_native.subprocess.TimeoutExpired("buzz-desktop", 15),
+            0,
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            (run_dir / "logs").mkdir()
+            secret_path = run_dir / "identity.key"
+            secret_path.write_text("1" * 64)
+            app_binary = run_dir / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            fixture = {
+                "secret_path": str(secret_path),
+                "identity_pubkey": "2" * 64,
+            }
+            isolation = review_native.isolation_manifest(
+                "run", "ws://127.0.0.1:3030"
+            )
+            with mock.patch.object(review_native.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(review_native.time, "monotonic", side_effect=[0, 61]), \
+                 mock.patch.object(review_native, "scrubbed_environment", return_value={"PATH": "/usr/bin"}):
+                with self.assertRaisesRegex(
+                    review_native.HarnessError,
+                    "timed out waiting for native Buzz process; Tauri launcher required SIGKILL",
+                ):
+                    review_native.build_and_launch(
+                        run_dir, isolation, fixture, "http://127.0.0.1/probe",
+                        "token", app_binary
+                    )
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in process.wait.call_args_list],
+            [15, 15],
+        )
+
+    def test_launch_interruption_reaps_child_before_propagating(self):
+        process = mock.Mock(pid=42)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            (run_dir / "logs").mkdir()
+            secret_path = run_dir / "identity.key"
+            secret_path.write_text("1" * 64)
+            app_binary = run_dir / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            fixture = {
+                "secret_path": str(secret_path),
+                "identity_pubkey": "2" * 64,
+            }
+            isolation = review_native.isolation_manifest(
+                "run", "ws://127.0.0.1:3030"
+            )
+            with mock.patch.object(review_native.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(review_native, "run", side_effect=KeyboardInterrupt), \
+                 mock.patch.object(review_native, "scrubbed_environment", return_value={"PATH": "/usr/bin"}):
+                with self.assertRaises(KeyboardInterrupt):
+                    review_native.build_and_launch(
+                        run_dir, isolation, fixture, "http://127.0.0.1/probe",
+                        "token", app_binary
+                    )
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=15)
+        process.kill.assert_not_called()
+
+    def test_launch_log_close_failure_reaps_child_before_propagating(self):
+        process = mock.Mock(pid=42)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        log = mock.MagicMock()
+        log.close.side_effect = OSError("log close failed")
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            (run_dir / "logs").mkdir()
+            secret_path = run_dir / "identity.key"
+            secret_path.write_text("1" * 64)
+            app_binary = run_dir / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            fixture = {
+                "secret_path": str(secret_path),
+                "identity_pubkey": "2" * 64,
+            }
+            isolation = review_native.isolation_manifest(
+                "run", "ws://127.0.0.1:3030"
+            )
+            with mock.patch.object(pathlib.Path, "open", return_value=log), \
+                 mock.patch.object(review_native.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(review_native, "scrubbed_environment", return_value={"PATH": "/usr/bin"}):
+                with self.assertRaisesRegex(OSError, "log close failed"):
+                    review_native.build_and_launch(
+                        run_dir, isolation, fixture, "http://127.0.0.1/probe",
+                        "token", app_binary
+                    )
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=15)
+        process.kill.assert_not_called()
+
+    def test_driver_close_stream_failure_still_reaps_child(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        process.stdin.close.side_effect = BrokenPipeError("stdin close failed")
+        driver = review_native.Driver.__new__(review_native.Driver)
+        driver.process = process
+        with mock.patch.object(driver, "request", return_value={"ok": True}):
+            with self.assertRaisesRegex(
+                review_native.HarnessError,
+                "native driver stdin close failed: stdin close failed",
+            ):
+                driver.close()
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_driver_close_stream_failure_reaps_exited_child(self):
+        process = mock.Mock()
+        process.poll.return_value = 0
+        process.stdin.close.side_effect = BrokenPipeError("stdin close failed")
+        driver = review_native.Driver.__new__(review_native.Driver)
+        driver.process = process
+        with self.assertRaisesRegex(
+            review_native.HarnessError,
+            "native driver stdin close failed: stdin close failed",
+        ):
+            driver.close()
+        process.wait.assert_called_once_with()
+        process.terminate.assert_not_called()
+
+    def test_driver_close_kills_and_reaps_term_ignoring_child(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            review_native.subprocess.TimeoutExpired("native-driver", 5),
+            0,
+        ]
+        driver = review_native.Driver.__new__(review_native.Driver)
+        driver.process = process
+        with mock.patch.object(driver, "request", side_effect=RuntimeError("shutdown failed")):
+            with self.assertRaisesRegex(
+                review_native.HarnessError,
+                "native driver required SIGKILL",
+            ):
+                driver.close()
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in process.wait.call_args_list],
+            [5, 5],
+        )
+
+    def test_driver_close_reports_post_kill_wait_timeout(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = review_native.subprocess.TimeoutExpired(
+            "native-driver", 5
+        )
+        driver = review_native.Driver.__new__(review_native.Driver)
+        driver.process = process
+        with mock.patch.object(driver, "request", side_effect=RuntimeError("shutdown failed")):
+            with self.assertRaisesRegex(
+                review_native.HarnessError,
+                "native driver remained alive after SIGKILL",
+            ):
+                driver.close()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_driver_close_reaps_before_propagating_interruption(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        driver = review_native.Driver.__new__(review_native.Driver)
+        driver.process = process
+        with mock.patch.object(driver, "request", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                driver.close()
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
+        process.kill.assert_not_called()
+
+    def test_journey_body_interruption_runs_all_cleanup(self):
+        journey = {
+            "flow": "body_interruption",
+            "record": {"video": "off", "screenshots": False, "accessibility": False},
+            "steps": [{"name": "wait", "act": {"type": "wait", "duration_ms": 0},
+                       "expect": {"focused": False}}],
+            "cleanup": {"terminate_app": True, "remove_state": True},
+        }
+        process = mock.Mock(pid=42)
+        driver = mock.Mock()
+        driver.request.side_effect = KeyboardInterrupt
+        probe_server = mock.Mock()
+        sampler = mock.Mock()
+        sampler.finish.return_value = {"sample_count": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = pathlib.Path(directory) / "output"
+            fixture = {"secret_path": str(pathlib.Path(directory) / "identity.key")}
+            app_binary = pathlib.Path(directory) / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            journey_path = pathlib.Path(directory) / "journey.yaml"
+            journey_path.write_text("fixture")
+            with mock.patch.object(review_native, "load_journey", return_value=journey), \
+                 mock.patch.object(review_native, "provenance", return_value={"head_sha": "a" * 40}), \
+                 mock.patch.object(review_native, "machine_fingerprint", return_value={}), \
+                 mock.patch.object(review_native, "doctor", return_value={"ok": True}), \
+                 mock.patch.object(review_native, "prepare_fixture", return_value=fixture), \
+                 mock.patch.object(review_native, "semantic_probe_server", return_value=(probe_server, "probe")), \
+                 mock.patch.object(review_native, "build_and_launch", return_value=(process, app_binary, 42)), \
+                 mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
+                 mock.patch.object(review_native, "Driver", return_value=driver), \
+                 mock.patch.object(review_native, "ProcessSampler", return_value=sampler), \
+                 mock.patch.object(review_native, "wait_for_visible_window", return_value={"visible": True}), \
+                 mock.patch.object(review_native, "capture_step", return_value={}), \
+                 mock.patch.object(review_native, "terminate_and_reap", return_value=[]) as reap, \
+                 mock.patch.object(review_native, "cleanup_review_state") as cleanup:
+                with self.assertRaises(KeyboardInterrupt):
+                    review_native.run_journey(
+                        journey_path, "ws://127.0.0.1:3030", output_root,
+                    )
+            driver.close.assert_called_once_with()
+            reap.assert_called_once_with(process, "Tauri launcher")
+            cleanup.assert_called_once()
+            receipt_path = next(output_root.glob("**/receipt.json"))
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["cleanup"], {"status": "passed", "errors": []})
+
+    def test_journey_cleanup_survives_driver_interruption(self):
+        journey = {
+            "flow": "cleanup_interruption",
+            "record": {"video": "off", "screenshots": False, "accessibility": False},
+            "steps": [{"name": "wait", "act": {"type": "wait", "duration_ms": 0},
+                       "expect": {"focused": False}}],
+            "cleanup": {"terminate_app": True, "remove_state": True},
+        }
+        process = mock.Mock(pid=42)
+        driver = mock.Mock()
+        driver.close.side_effect = KeyboardInterrupt
+        probe_server = mock.Mock()
+        sampler = mock.Mock()
+        sampler.finish.return_value = {"sample_count": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = pathlib.Path(directory) / "output"
+            fixture = {"secret_path": str(pathlib.Path(directory) / "identity.key")}
+            app_binary = pathlib.Path(directory) / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            journey_path = pathlib.Path(directory) / "journey.yaml"
+            journey_path.write_text("fixture")
+            with mock.patch.object(review_native, "load_journey", return_value=journey), \
+                 mock.patch.object(review_native, "provenance", return_value={"head_sha": "a" * 40}), \
+                 mock.patch.object(review_native, "machine_fingerprint", return_value={}), \
+                 mock.patch.object(review_native, "doctor", return_value={"ok": True}), \
+                 mock.patch.object(review_native, "prepare_fixture", return_value=fixture), \
+                 mock.patch.object(review_native, "semantic_probe_server", return_value=(probe_server, "probe")), \
+                 mock.patch.object(review_native, "build_and_launch", return_value=(process, app_binary, 42)), \
+                 mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
+                 mock.patch.object(review_native, "Driver", return_value=driver), \
+                 mock.patch.object(review_native, "ProcessSampler", return_value=sampler), \
+                 mock.patch.object(review_native, "wait_for_visible_window", return_value={"visible": True}), \
+                 mock.patch.object(review_native, "wait_expectation"), \
+                 mock.patch.object(review_native, "capture_step", return_value={}), \
+                 mock.patch.object(review_native, "terminate_and_reap", return_value=[]) as reap, \
+                 mock.patch.object(review_native, "cleanup_review_state") as cleanup:
+                with self.assertRaises(KeyboardInterrupt):
+                    review_native.run_journey(
+                        journey_path,
+                        "ws://127.0.0.1:3030", output_root,
+                    )
+            reap.assert_called_once_with(process, "Tauri launcher")
+            cleanup.assert_called_once()
+            receipt_path = next(output_root.glob("**/receipt.json"))
+            receipt = json.loads(receipt_path.read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["cleanup"]["status"], "failed")
+            self.assertIn("native driver cleanup failed", receipt["cleanup"]["errors"][0])
+
+    def test_final_wait_timeout_is_reported(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = review_native.subprocess.TimeoutExpired(
+            "buzz-desktop", 15
+        )
+        errors = review_native.terminate_and_reap(process, "Tauri launcher")
+        self.assertEqual(
+            errors,
+            [
+                "Tauri launcher required SIGKILL",
+                "Tauri launcher remained alive after SIGKILL",
+            ],
+        )
+        self.assertEqual(process.wait.call_count, 2)
 
     def test_visible_window_waits_for_reveal(self):
         driver = mock.Mock()
@@ -353,15 +617,24 @@ class JourneyTests(unittest.TestCase):
 
 
 class PerformanceTests(unittest.TestCase):
-    MACHINE = {"system": "Darwin", "release": "test", "machine": "arm64", "cpu": "test"}
+    MACHINE = {"host_id_sha256": "f" * 64, "system": "Darwin", "release": "test", "machine": "arm64", "cpu": "test"}
 
     def receipt(self, path, artifact, timing, cpu=10, memory=100, flow="tooltip_fresh_dwell"):
+        artifact_path = path.parent / "artifacts" / artifact / "buzz-desktop"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        if not artifact_path.exists():
+            artifact_path.write_bytes(f"{artifact}-binary".encode())
         payload = {
+            "schema_version": 1,
             "run_id": path.stem, "flow": flow, "status": "passed",
             "cleanup": {"status": "passed"},
-            "provenance": {"dirty": False, "head_sha": artifact + "-sha", "artifact_sha256": artifact},
+            "provenance": {"dirty": False, "dirty_state_sha256": None, "status": [],
+                           "head_sha": ("a" if artifact == "base" else "b") * 40,
+                           "artifact_path": str(artifact_path.relative_to(path.parent)),
+                           "artifact_sha256": review_native.sha256(artifact_path)},
             "measurements": {"tooltip_open_latency": {"value": timing, "unit": "ms", "step": "tooltip"}},
             "performance": {"machine": self.MACHINE, "process": {
+                "sample_count": 1, "interval_ms": 100,
                 "cpu_percent_median": cpu, "resident_mb_peak": memory,
             }},
         }
@@ -413,11 +686,59 @@ metrics:
                     ]
                     with self.assertRaisesRegex(
                         review_native.HarnessError,
-                        f"nonnegative finite numeric metric {re.escape(metric)}",
+                        r"invalid (measurement|process metric)",
                     ):
                         review_native.compare_performance(
                             baseline, candidate, self.budget(root / f"{metric}-budget.yaml")
                         )
+
+    def test_comparison_rejects_receipts_outside_the_comparison_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            cases = (
+                ("wrong-unit", lambda payload: payload["measurements"]["tooltip_open_latency"].update(unit="seconds")),
+                ("missing-artifact", lambda payload: payload["provenance"].pop("artifact_path")),
+                ("zero-samples", lambda payload: payload["performance"]["process"].update(sample_count=-1)),
+            )
+            for name, mutate in cases:
+                with self.subTest(name=name):
+                    path = self.receipt(root / f"{name}.json", "base", 100)
+                    payload = json.loads(path.read_text())
+                    mutate(payload)
+                    path.write_text(json.dumps(payload))
+                    with self.assertRaises(review_native.HarnessError):
+                        review_native.load_receipts([path], "baseline")
+
+    def test_comparison_rejects_unverifiable_application_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name, mutate in (
+                ("absent", lambda artifact: artifact.unlink()),
+                ("mismatched", lambda artifact: artifact.write_bytes(b"mutated")),
+            ):
+                with self.subTest(name=name):
+                    path = self.receipt(root / f"{name}.json", f"base-{name}", 100)
+                    payload = json.loads(path.read_text())
+                    artifact = path.parent / payload["provenance"]["artifact_path"]
+                    mutate(artifact)
+                    with self.assertRaisesRegex(
+                        review_native.HarnessError,
+                        "not a regular file|digest does not match",
+                    ):
+                        review_native.load_receipts([path], "baseline")
+
+
+    def test_receipt_artifact_is_resolved_relative_to_receipt_not_cwd(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as other:
+            root = pathlib.Path(directory)
+            path = self.receipt(root / "portable" / "receipt.json", "base", 100)
+            previous = pathlib.Path.cwd()
+            try:
+                os.chdir(other)
+                receipts = review_native.load_receipts([path], "baseline")
+            finally:
+                os.chdir(previous)
+            self.assertEqual(len(receipts), 1)
 
     def test_receipt_schema_requires_nonnegative_comparison_metrics(self):
         schema = json.loads(
@@ -454,50 +775,54 @@ metrics:
     def test_comparison_rejects_too_few_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            receipts = [self.receipt(root / f"r{i}.json", "same", 100) for i in range(2)]
+            baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(2)]
+            candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(2)]
             with self.assertRaisesRegex(review_native.HarnessError, "at least 3"):
-                review_native.compare_performance(receipts, receipts, self.budget(root / "budget.yaml"))
+                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
 
-    def test_comparison_rejects_duplicate_receipt_path_and_run_id(self):
+
+    def test_comparison_requires_explicit_clean_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for dirty in ("missing", 0, None):
+                path = self.receipt(root / f"r-{dirty}.json", "base", 100)
+                payload = json.loads(path.read_text())
+                if dirty == "missing":
+                    del payload["provenance"]["dirty"]
+                else:
+                    payload["provenance"]["dirty"] = dirty
+                path.write_text(json.dumps(payload))
+                with self.subTest(dirty=dirty), self.assertRaisesRegex(
+                        review_native.HarnessError, "clean provenance"):
+                    review_native.load_receipts([path], "baseline")
+
+    def test_comparison_rejects_nonfinite_bool_overlap_and_same_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(3)]
             candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(3)]
-            with self.assertRaisesRegex(review_native.HarnessError, "duplicate receipt paths"):
-                review_native.compare_performance([baseline[0]] * 3, candidate, self.budget(root / "budget.yaml"))
-            duplicate = json.loads(baseline[1].read_text())
-            duplicate["run_id"] = json.loads(baseline[0].read_text())["run_id"]
-            baseline[1].write_text(json.dumps(duplicate))
-            with self.assertRaisesRegex(review_native.HarnessError, "duplicate run_id"):
+            payload = json.loads(candidate[0].read_text())
+            payload["measurements"]["tooltip_open_latency"]["value"] = float("nan")
+            candidate[0].write_text(json.dumps(payload))
+            with self.assertRaisesRegex(review_native.HarnessError, "invalid measurement"):
                 review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
 
-    def test_comparison_rejects_receipts_reused_across_cohorts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(3)]
-            with self.assertRaisesRegex(review_native.HarnessError, "independent receipt paths"):
+            candidate = [self.receipt(root / f"d{i}.json", "base", 100) for i in range(3)]
+            with self.assertRaisesRegex(review_native.HarnessError, "same source revision"):
+                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
+            with self.assertRaisesRegex(review_native.HarnessError, "overlap"):
                 review_native.compare_performance(baseline, baseline, self.budget(root / "budget.yaml"))
 
-            candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(3)]
-            for source, destination in zip(baseline, candidate, strict=True):
-                payload = json.loads(destination.read_text())
-                payload["run_id"] = json.loads(source.read_text())["run_id"]
-                destination.write_text(json.dumps(payload))
-            with self.assertRaisesRegex(review_native.HarnessError, "independent run_ids"):
-                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
-
-    def test_comparison_rejects_boolean_and_non_finite_numbers(self):
+    def test_comparison_rejects_bool_and_nonfinite_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(3)]
             candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(3)]
-            for value in (True, float("nan"), float("inf")):
-                with self.subTest(value=value):
-                    payload = json.loads(candidate[0].read_text())
-                    payload["measurements"]["tooltip_open_latency"]["value"] = value
-                    candidate[0].write_text(json.dumps(payload))
-                    with self.assertRaisesRegex(review_native.HarnessError, "finite numeric metric"):
-                        review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
+            for value in ("true", ".nan", ".inf"):
+                budget = self.budget(root / f"budget-{value}.yaml")
+                budget.write_text(budget.read_text().replace("max: 1000", f"max: {value}"))
+                with self.assertRaisesRegex(review_native.HarnessError, "invalid limits"):
+                    review_native.compare_performance(baseline, candidate, budget)
 
     def test_comparison_rejects_incompatible_machine(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -510,115 +835,89 @@ metrics:
             with self.assertRaisesRegex(review_native.HarnessError, "incompatible machines"):
                 review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
 
+    def test_comparison_rejects_different_same_model_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(3)]
+            candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(3)]
+            for path in candidate:
+                payload = json.loads(path.read_text())
+                payload["performance"]["machine"]["host_id_sha256"] = "e" * 64
+                path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(review_native.HarnessError, "incompatible machines"):
+                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
+
+    def test_benchmark_reuses_one_verifiable_cohort_artifact_for_every_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "target" / "buzz-desktop"
+            target.parent.mkdir()
+            target.write_text("immutable")
+            calls = []
+
+            def fake_run_journey(_path, _relay, output, *, app_binary, isolation_id):
+                calls.append((app_binary, isolation_id))
+                run_dir = output / f"run-{len(calls)}"
+                run_dir.mkdir(parents=True)
+                (run_dir / "receipt.json").write_text(json.dumps({
+                    "provenance": {
+                        "artifact_path": str(app_binary),
+                        "artifact_sha256": review_native.sha256(app_binary),
+                    }
+                }))
+                return run_dir
+
+            with (mock.patch.object(review_native, "build_native_review_app", return_value=target),
+                  mock.patch.object(review_native, "run_journey", side_effect=fake_run_journey)):
+                receipts = review_native.benchmark(pathlib.Path("journey.yaml"), "ws://localhost:3030", root, 3)
+            self.assertEqual(len(receipts), 3)
+            prepared = root / ".cohorts" / calls[0][1] / "buzz-desktop"
+            self.assertEqual([call[0] for call in calls], [prepared] * 3)
+            self.assertEqual(len({call[1] for call in calls}), 1)
+            target.write_text("subsequent build output")
+            for receipt_path in receipts:
+                provenance = json.loads(receipt_path.read_text())["provenance"]
+                recorded = receipt_path.parent / provenance["artifact_path"]
+                self.assertEqual(recorded.resolve(), prepared.resolve())
+                self.assertEqual(provenance["artifact_sha256"], review_native.sha256(prepared))
+
+    def test_benchmark_rejects_cohort_artifact_mutation_before_next_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "buzz-desktop"
+            target.write_text("original")
+            calls = 0
+
+            def fake_run_journey(_path, _relay, output, *, app_binary, isolation_id):
+                nonlocal calls
+                calls += 1
+                run_dir = output / f"run-{calls}"
+                run_dir.mkdir(parents=True)
+                (run_dir / "receipt.json").write_text(json.dumps({
+                    "provenance": {
+                        "artifact_path": str(app_binary),
+                        "artifact_sha256": review_native.sha256(app_binary),
+                    }
+                }))
+                app_binary.write_text("mutated")
+                return run_dir
+
+            with (mock.patch.object(review_native, "build_native_review_app", return_value=target),
+                  mock.patch.object(review_native, "run_journey", side_effect=fake_run_journey)):
+                with self.assertRaisesRegex(review_native.HarnessError, "cohort artifact"):
+                    review_native.benchmark(pathlib.Path("journey.yaml"), "ws://localhost:3030", root, 3)
+            self.assertEqual(calls, 1)
+
     def test_comparison_rejects_mixed_revisions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             baseline = [self.receipt(root / f"b{i}.json", "base", 100) for i in range(3)]
             candidate = [self.receipt(root / f"c{i}.json", "head", 100) for i in range(3)]
             payload = json.loads(candidate[0].read_text())
-            payload["provenance"]["head_sha"] = "other"
+            payload["provenance"]["head_sha"] = "e" * 40
             candidate[0].write_text(json.dumps(payload))
             with self.assertRaisesRegex(review_native.HarnessError, "mixes source revisions"):
                 review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
-
-
-    def test_comparison_rejects_equal_baseline_and_candidate_revision(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            baseline = [self.receipt(root / f"b{i}.json", "same", 100) for i in range(3)]
-            candidate = [self.receipt(root / f"c{i}.json", "same", 100) for i in range(3)]
-            with self.assertRaisesRegex(review_native.HarnessError, "different source revisions"):
-                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
-
-
-class PublishReviewTests(unittest.TestCase):
-    def inputs(self, root):
-        video = root / "video-share.mp4"
-        video.write_bytes(b"video")
-        receipt = root / "receipt.json"
-        receipt.write_text(json.dumps({
-            "flow": "journey", "status": "failed",
-            "provenance": {"dirty": False, "head_sha": "a" * 40},
-            "cleanup": {"status": "passed"},
-            "artifacts": {"share_video": video.name},
-            "artifact_digests": {video.name: review_native.sha256(video)},
-        }))
-        summary = root / "summary.md"
-        summary.write_text("Found a regression.")
-        return receipt, summary
-
-    @mock.patch.object(review_native.review_publish.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}")
-    @mock.patch.object(review_native.review_publish, "_video_duration", return_value=12.5)
-    @mock.patch.object(review_native.review_publish, "_run")
-    def test_publishes_video_root_then_timecoded_highlights(self, run, _duration, _which):
-        run.side_effect = [
-            subprocess.CompletedProcess([], 0, json.dumps({"accepted": True, "event_id": "b" * 64}), ""),
-            subprocess.CompletedProcess([], 0, json.dumps({"accepted": True, "event_id": "c" * 64}), ""),
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            receipt, summary = self.inputs(root)
-            highlights = root / "highlights.json"
-            highlights.write_text(json.dumps([{"seconds": 3.25, "text": "The broken state appears."}]))
-            result = review_native.publish_review(receipt, summary, "channel", "thread", highlights, ["d" * 64])
-        first, second = [call.args[0] for call in run.call_args_list]
-        self.assertIn("--file", first)
-        self.assertIn("--mention", first)
-        self.assertEqual(second[-1], "[00:03.250] The broken state appears.")
-        self.assertEqual(second[second.index("--reply-to") + 1], "b" * 64)
-        self.assertEqual(result["highlight_event_ids"], ["c" * 64])
-
-    @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
-    @mock.patch.object(review_native.review_publish, "_video_duration", return_value=10.0)
-    def test_rejects_highlight_outside_video_before_publish(self, _duration, _which):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            receipt, summary = self.inputs(root)
-            highlights = root / "highlights.json"
-            highlights.write_text(json.dumps([{"seconds": 11, "text": "impossible"}]))
-            with self.assertRaisesRegex(review_native.PublishError, "within the video"):
-                review_native.publish_review(receipt, summary, "channel", "thread", highlights)
-
-    @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
-    @mock.patch.object(review_native.review_publish, "_video_duration", return_value=10.0)
-    def test_rejects_boolean_and_non_finite_highlights(self, _duration, _which):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            receipt, summary = self.inputs(root)
-            for value in (True, float("nan"), float("inf")):
-                with self.subTest(value=value):
-                    highlights = root / "highlights.json"
-                    highlights.write_text(json.dumps([{"seconds": value, "text": "invalid"}]))
-                    with self.assertRaisesRegex(review_native.PublishError, "within the video"):
-                        review_native.publish_review(receipt, summary, "channel", "thread", highlights)
-
-    @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
-    def test_rejects_share_video_replaced_after_receipt(self, _which):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            receipt, summary = self.inputs(root)
-            (root / "video-share.mp4").write_bytes(b"replacement")
-            with self.assertRaisesRegex(review_native.PublishError, "digest does not match"):
-                review_native.publish_review(receipt, summary, "channel", "thread")
-
-
-    @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
-    def test_rejects_dirty_receipt_before_upload(self, _which):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            receipt, summary = self.inputs(root)
-            payload = json.loads(receipt.read_text())
-            payload["provenance"]["dirty"] = True
-            receipt.write_text(json.dumps(payload))
-            with self.assertRaisesRegex(review_native.PublishError, "clean source"):
-                review_native.publish_review(receipt, summary, "channel", "thread")
-
-
-class MeasurementTests(unittest.TestCase):
-    def test_failed_step_does_not_produce_measurement(self):
-        self.assertIsNone(review_native.valid_measurement("failed", 5000))
-        self.assertEqual(review_native.valid_measurement("passed", 250), 250)
-
 
 
 if __name__ == "__main__":

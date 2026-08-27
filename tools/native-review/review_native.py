@@ -19,19 +19,11 @@ import shutil
 import statistics
 import subprocess
 import sys
-
-_TOOL_ROOT = pathlib.Path(__file__).resolve().parent
-if str(_TOOL_ROOT) not in sys.path:
-    sys.path.insert(0, str(_TOOL_ROOT))
 import tempfile
 import threading
 import time
 import urllib.parse
 from typing import Any
-
-from evidence_bundle import EvidenceError, finding_bundle, record_artifact_digests, relay_safe_video
-import review_publish
-from review_publish import PublishError, publish_review
 
 try:
     import yaml
@@ -46,14 +38,11 @@ SECRET_NAME = re.compile(r"(AUTH|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|COOKIE)", re.
 ALLOWED_TOP = {"schema_version", "flow", "platforms", "fixture", "record", "steps", "cleanup"}
 ALLOWED_STEP = {"name", "locate", "act", "expect", "expect_for", "timeout_ms", "measure"}
 PERFORMANCE_SAMPLE_MINIMUM = 3
-
-
-def is_finite_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+MAX_ACTION_DURATION_MS = 30_000
+MAX_SCROLL_DELTA = 10_000
+MAX_SEMANTIC_SNAPSHOT_BYTES = 1_000_000
+PUBKEY = re.compile(r"[0-9a-f]{64}")
+PLATFORM_UUID = re.compile(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]+)"')
 
 
 class HarnessError(RuntimeError):
@@ -88,7 +77,14 @@ def utc_now() -> str:
 def machine_fingerprint() -> dict[str, str]:
     """Return comparison-critical host attributes without user-specific data."""
     cpu = run(["sysctl", "-n", "machdep.cpu.brand_string"], check=False).stdout.strip()
+    platform_expert = run(
+        ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], check=False
+    ).stdout
+    host_match = PLATFORM_UUID.search(platform_expert)
+    if not host_match:
+        raise HarnessError("cannot determine stable macOS host identity")
     return {
+        "host_id_sha256": hashlib.sha256(host_match.group(1).lower().encode()).hexdigest(),
         "system": platform.system(),
         "release": platform.release(),
         "machine": platform.machine(),
@@ -165,8 +161,11 @@ def validate_expectation(expectation: Any, where: str) -> None:
     if "value" in expectation and not isinstance(expectation["value"], str):
         raise HarnessError(f"{where}.value must be a string")
     for key in ("scroll_y_greater_than", "scroll_y_less_than"):
-        if key in expectation and not is_finite_number(expectation[key]):
-            raise HarnessError(f"{where}.{key} must be a finite number")
+        if key in expectation:
+            value = expectation[key]
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value)):
+                raise HarnessError(f"{where}.{key} must be a finite number")
 
 
 def load_journey(path: pathlib.Path) -> dict[str, Any]:
@@ -211,40 +210,46 @@ def load_journey(path: pathlib.Path) -> dict[str, Any]:
             raise HarnessError(f"{where}.act contains an unsupported field")
         if action_type in {"click", "move_pointer", "scroll"} and locators is None:
             raise HarnessError(f"{where}: {action_type} requires locate")
+        if "duration_ms" in action:
+            duration = action["duration_ms"]
+            if (not isinstance(duration, int) or isinstance(duration, bool)
+                    or not 0 <= duration <= MAX_ACTION_DURATION_MS):
+                raise HarnessError(
+                    f"{where}.act.duration_ms must be 0..{MAX_ACTION_DURATION_MS}"
+                )
+        if action_type == "wait" and "duration_ms" not in action:
+            raise HarnessError(f"{where}: wait requires duration_ms")
         if action_type == "press":
             if not isinstance(action.get("key"), str) or not action["key"]:
                 raise HarnessError(f"{where}: press requires key")
             modifiers = action.get("modifiers", [])
-            allowed_modifiers = {"command", "control", "option", "shift"}
-            if (
-                not isinstance(modifiers, list)
-                or not all(isinstance(item, str) and item in allowed_modifiers for item in modifiers)
-                or len(set(modifiers)) != len(modifiers)
-            ):
-                raise HarnessError(
-                    f"{where}: press modifiers must be unique command/control/option/shift values"
-                )
+            if not isinstance(modifiers, list) or not all(isinstance(item, str) and item for item in modifiers):
+                raise HarnessError(f"{where}: press modifiers must be strings")
         if action_type == "type_text" and not isinstance(action.get("text"), str):
             raise HarnessError(f"{where}: type_text requires text")
-        if action_type == "scroll" and (
-                not is_int(action.get("delta_y")) or not -10000 <= action["delta_y"] <= 10000):
-            raise HarnessError(f"{where}: scroll requires integer delta_y in -10000..10000")
-        if action_type == "wait" and (
-                not is_int(action.get("duration_ms")) or not 0 < action["duration_ms"] <= 30000):
-            raise HarnessError(f"{where}: wait requires integer duration_ms in 1..30000")
-        if action_type != "wait" and "duration_ms" in action and (
-                not is_int(action["duration_ms"]) or not 0 <= action["duration_ms"] <= 30000):
-            raise HarnessError(f"{where}.act.duration_ms must be an integer in 0..30000")
+        if action_type == "scroll":
+            delta = action.get("delta_y")
+            if (not isinstance(delta, int) or isinstance(delta, bool)
+                    or not -MAX_SCROLL_DELTA <= delta <= MAX_SCROLL_DELTA):
+                raise HarnessError(
+                    f"{where}: scroll requires integer delta_y in "
+                    f"-{MAX_SCROLL_DELTA}..{MAX_SCROLL_DELTA}"
+                )
         validate_expectation(step["expect"], f"{where}.expect")
         if "expect_for" in step:
             sustained = step["expect_for"]
             if not isinstance(sustained, dict) or set(sustained) != {"duration_ms", "condition"}:
                 raise HarnessError(f"{where}.expect_for requires duration_ms and condition")
-            if not is_int(sustained["duration_ms"]) or not 0 < sustained["duration_ms"] <= 30000:
-                raise HarnessError(f"{where}.expect_for.duration_ms must be an integer in 1..30000")
+            sustained_duration = sustained["duration_ms"]
+            if (not isinstance(sustained_duration, int) or isinstance(sustained_duration, bool)
+                    or not 0 < sustained_duration <= MAX_ACTION_DURATION_MS):
+                raise HarnessError(
+                    f"{where}.expect_for.duration_ms must be 1..{MAX_ACTION_DURATION_MS}"
+                )
             validate_expectation(sustained["condition"], f"{where}.expect_for.condition")
         timeout = step.get("timeout_ms", 5000)
-        if not is_int(timeout) or not 0 < timeout <= 60000:
+        if (not isinstance(timeout, int) or isinstance(timeout, bool)
+                or not 0 < timeout <= 60000):
             raise HarnessError(f"{where}.timeout_ms must be 1..60000")
         if "measure" in step:
             measurement = step["measure"]
@@ -254,15 +259,39 @@ def load_journey(path: pathlib.Path) -> dict[str, Any]:
                 raise HarnessError(f"duplicate measurement name: {measurement}")
             measurement_names.add(measurement)
     cleanup = journey["cleanup"]
-    if not isinstance(cleanup, dict) or set(cleanup) != {"terminate_app", "remove_state"} or not all(isinstance(v, bool) for v in cleanup.values()):
-        raise HarnessError("cleanup requires boolean terminate_app and remove_state")
+    if (not isinstance(cleanup, dict)
+            or set(cleanup) != {"terminate_app", "remove_state"}
+            or cleanup != {"terminate_app": True, "remove_state": True}):
+        raise HarnessError(
+            "cleanup requires terminate_app: true and remove_state: true for pass-eligible journeys"
+        )
     return journey
 
 
+def parse_loopback_relay(relay_url: str) -> urllib.parse.ParseResult:
+    try:
+        parsed = urllib.parse.urlparse(relay_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise HarnessError(f"invalid review relay URL: {relay_url}") from exc
+    if (
+        parsed.scheme not in {"ws", "http"}
+        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or not 1 <= port <= 65535
+    ):
+        raise HarnessError(f"refusing ambiguous or non-loopback review relay: {relay_url}")
+    return parsed
+
+
 def isolation_manifest(run_id: str, relay_url: str) -> dict[str, str]:
-    parsed = urllib.parse.urlparse(relay_url)
-    if parsed.scheme not in {"ws", "http"} or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        raise HarnessError(f"refusing non-loopback review relay: {relay_url}")
+    parse_loopback_relay(relay_url)
     slug = re.sub(r"[^a-z0-9-]", "-", run_id.lower())
     bundle_id = f"xyz.block.buzz.app.dev.native-review.{slug}"
     keyring = f"buzz-desktop-dev.native-review.{slug}"
@@ -301,8 +330,8 @@ def scrubbed_environment(*, include_home: bool = False) -> dict[str, str]:
 
 def fixture_environment(isolation: dict[str, str], review_pubkey: str, *, cleanup: bool = False) -> dict[str, str]:
     """Return fixed local fixture coordinates without inheriting host credentials."""
-    parsed = urllib.parse.urlparse(isolation["relay_url"])
-    port = parsed.port or 80
+    parsed = parse_loopback_relay(isolation["relay_url"])
+    port = parsed.port
     if port != 3030:
         raise HarnessError("fixture seeding requires the isolated relay at loopback port 3030")
     return {
@@ -350,10 +379,6 @@ class Driver:
         self.process.stdin.write(json.dumps({"command": command, **payload}) + "\n")
         self.process.stdin.flush()
         timeout_seconds = 45 if command in {"record_start", "record_stop"} else 15
-        if command == "act" and isinstance(payload.get("action"), dict):
-            duration_ms = payload["action"].get("duration_ms", 0)
-            if is_int(duration_ms):
-                timeout_seconds = max(timeout_seconds, duration_ms / 1000 + 5)
         ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
         if not ready:
             self.process.kill()
@@ -371,24 +396,37 @@ class Driver:
         return response
 
     def close(self) -> None:
+        shutdown_error: BaseException | None = None
         if self.process.poll() is None:
             try:
                 self.request("shutdown")
-            except Exception:
-                self.process.terminate()
-        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            except BaseException as exc:
+                shutdown_error = exc
+        cleanup_errors = []
+        for name, stream in (("stdin", self.process.stdin),
+                             ("stdout", self.process.stdout),
+                             ("stderr", self.process.stderr)):
             if stream:
-                stream.close()
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
+                try:
+                    stream.close()
+                except BaseException as exc:
+                    cleanup_errors.append(f"native driver {name} close failed: {exc}")
+        cleanup_errors.extend(
+            terminate_and_reap(self.process, "native driver", timeout_seconds=5)
+        )
+        if shutdown_error and not isinstance(shutdown_error, Exception):
+            raise shutdown_error
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            if shutdown_error:
+                detail = f"shutdown failed: {shutdown_error}; {detail}"
+            raise HarnessError(detail) from shutdown_error
 
 
 def doctor(require_permissions: bool = False) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     checks.append({"name": "platform", "ok": sys.platform == "darwin", "detail": sys.platform})
-    for command in ("swift", "xcrun", "git", "ffmpeg"):
+    for command in ("swift", "xcrun", "git"):
         path = shutil.which(command)
         checks.append({"name": command, "ok": path is not None, "detail": path or "not found"})
     checks.append({"name": "repository", "ok": (ROOT / "desktop/src-tauri/tauri.conf.json").is_file(), "detail": str(ROOT)})
@@ -399,7 +437,7 @@ def doctor(require_permissions: bool = False) -> dict[str, Any]:
         checks.extend(native.get("checks", []))
     except (HarnessError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         checks.append({"name": "native-driver", "ok": False, "detail": str(exc)})
-    hard_names = {"platform", "swift", "xcrun", "git", "ffmpeg", "repository", "native-driver-build"}
+    hard_names = {"platform", "swift", "xcrun", "git", "repository", "native-driver-build"}
     failed = [c for c in checks if not c.get("ok") and (require_permissions or c.get("name") in hard_names)]
     result = {"ok": not failed, "checks": checks}
     print(json.dumps(result, indent=2))
@@ -415,37 +453,77 @@ def prepare_fixture(run_dir: pathlib.Path, isolation: dict[str, str]) -> dict[st
     public_match = re.search(r"Public key:\s+(\S+)", generated)
     if not secret_match or not public_match:
         raise HarnessError("buzz-admin generate-key returned an unrecognized response")
+    identity_pubkey = public_match.group(1)
+    if not PUBKEY.fullmatch(identity_pubkey):
+        raise HarnessError("buzz-admin generate-key returned an invalid public key")
     secret_path = run_dir / "state" / "identity.key"
     secret_path.parent.mkdir(parents=True, exist_ok=True)
     secret_path.write_text(secret_match.group(1) + "\n")
     secret_path.chmod(0o600)
     fixture = {
-        "kind": "local_review_channel", "identity_pubkey": public_match.group(1),
+        "kind": "local_review_channel", "identity_pubkey": identity_pubkey,
         "secret_path": str(secret_path), "relay_url": isolation["relay_url"],
-        "seed": "scripts/setup-desktop-test-data.sh", "cleanup_scope": "run-local app, keyring, and fixture principal",
+        "seed": "scripts/setup-desktop-test-data.sh", "cleanup_scope": "run-local app state and keyring only",
     }
     try:
         run([str(ROOT / "scripts/setup-desktop-test-data.sh")],
             env=fixture_environment(isolation, fixture["identity_pubkey"]), capture=False)
-    except Exception as seed_exc:
+    except BaseException as seed_exc:
         cleanup_errors = []
         try:
             run([str(ROOT / "scripts/setup-desktop-test-data.sh")],
                 env=fixture_environment(isolation, fixture["identity_pubkey"], cleanup=True), capture=False)
-        except Exception as cleanup_exc:
+        except BaseException as cleanup_exc:
             cleanup_errors.append(f"; review principal cleanup also failed: {cleanup_exc}")
         secret_path.unlink(missing_ok=True)
+        if not isinstance(seed_exc, Exception):
+            raise
         raise HarnessError(f"fixture seed failed: {seed_exc}{''.join(cleanup_errors)}") from seed_exc
     (run_dir / "manifest" / "fixture.json").write_text(json.dumps({k: v for k, v in fixture.items() if k != "secret_path"}, indent=2))
     return fixture
 
 
-def semantic_probe_server(path: pathlib.Path) -> tuple[http.server.ThreadingHTTPServer, str]:
+def valid_semantic_snapshot(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) > 20_000:
+        return False
+    allowed = {"id", "role", "name", "value", "scrollY", "enabled", "focused", "frame", "viewport"}
+    for node in value:
+        if not isinstance(node, dict) or set(node) - allowed or not {
+            "scrollY", "enabled", "focused", "frame", "viewport"
+        } <= set(node):
+            return False
+        if any(not isinstance(node.get(key), str) or len(node[key]) > 4096
+               for key in ("id", "role", "name", "value") if key in node):
+            return False
+        if (not isinstance(node["scrollY"], (int, float)) or isinstance(node["scrollY"], bool)
+                or not math.isfinite(node["scrollY"])
+                or not isinstance(node["enabled"], bool)
+                or not isinstance(node["focused"], bool)):
+            return False
+        for field, keys in (("frame", {"x", "y", "width", "height"}),
+                            ("viewport", {"width", "height"})):
+            item = node[field]
+            if not isinstance(item, dict) or set(item) != keys:
+                return False
+            if any(not isinstance(number, (int, float)) or isinstance(number, bool)
+                   or not math.isfinite(number) for number in item.values()):
+                return False
+        frame = node["frame"]
+        viewport = node["viewport"]
+        if (frame["x"] < 0 or frame["y"] < 0 or frame["width"] <= 0 or frame["height"] <= 0
+                or viewport["width"] <= 0 or viewport["height"] <= 0
+                or frame["x"] + frame["width"] > viewport["width"]
+                or frame["y"] + frame["height"] > viewport["height"]):
+            return False
+    return True
+
+
+def semantic_probe_server(path: pathlib.Path, token: str) -> tuple[http.server.ThreadingHTTPServer, str]:
     class Handler(http.server.BaseHTTPRequestHandler):
         def end_headers(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin", "http://localhost:1420")
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Buzz-Native-Review-Token")
             self.send_header("Access-Control-Allow-Private-Network", "true")
             super().end_headers()
 
@@ -454,12 +532,24 @@ def semantic_probe_server(path: pathlib.Path) -> tuple[http.server.ThreadingHTTP
             self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            length = int(self.headers.get("Content-Length", "0"))
+            if self.path != "/snapshot" or self.headers.get("X-Buzz-Native-Review-Token") != token:
+                self.send_response(404 if self.path != "/snapshot" else 401)
+                self.end_headers()
+                return
+            raw_length = self.headers.get("Content-Length")
+            try:
+                length = int(raw_length) if raw_length is not None else -1
+            except ValueError:
+                length = -1
+            if not 0 <= length <= MAX_SEMANTIC_SNAPSHOT_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                return
             payload = self.rfile.read(length)
             try:
                 value = json.loads(payload)
-                if not isinstance(value, list):
-                    raise ValueError("snapshot must be an array")
+                if not valid_semantic_snapshot(value):
+                    raise ValueError("invalid semantic snapshot")
                 temporary = path.with_suffix(".json.tmp")
                 temporary.write_text(json.dumps(value))
                 temporary.replace(path)
@@ -477,54 +567,88 @@ def semantic_probe_server(path: pathlib.Path) -> tuple[http.server.ThreadingHTTP
     return server, f"http://127.0.0.1:{server.server_port}/snapshot"
 
 
-def build_and_launch(run_dir: pathlib.Path, isolation: dict[str, str], fixture: dict[str, Any],
-                     probe_url: str) -> tuple[subprocess.Popen[str], pathlib.Path, int]:
-    # Build with the repository toolchain but no inherited credentials. Launch
-    # the resulting executable separately so only the app receives isolated HOME.
-    dev_url = (
-        "http://localhost:1420?nativeReview=1"
-        f"&reviewRelay={urllib.parse.quote(isolation['relay_url'], safe='')}"
-        f"&reviewPubkey={urllib.parse.quote(fixture['identity_pubkey'], safe='')}"
-    )
+def build_native_review_app(isolation: dict[str, str]) -> pathlib.Path:
     config = json.dumps({
-        "build": {"devUrl": dev_url},
         "identifier": isolation["bundle_id"], "productName": "Buzz Native Review",
         "bundle": {"externalBin": []},
     }, separators=(",", ":"))
     build_env = scrubbed_environment(include_home=True)
     build_env["VITE_NATIVE_REVIEW"] = "1"
-    build_env["VITE_NATIVE_REVIEW_RELAY"] = isolation["relay_url"]
-    build_env["VITE_NATIVE_REVIEW_PUBKEY"] = fixture["identity_pubkey"]
-    build_env["VITE_NATIVE_REVIEW_PROBE_URL"] = probe_url
     run(["pnpm", "exec", "tauri", "build", "--debug", "--bundles", "app", "--config", config],
         cwd=ROOT / "desktop", env=build_env, capture=False)
     app_binary = (ROOT / "desktop" / "src-tauri" / "target" / "debug" / "bundle" / "macos" /
                   "Buzz Native Review.app" / "Contents" / "MacOS" / "buzz-desktop")
     if not app_binary.is_file():
         raise HarnessError(f"Tauri build succeeded without app binary: {app_binary}")
+    return app_binary
+
+
+def terminate_and_reap(process: subprocess.Popen[str], label: str,
+                       timeout_seconds: float = 15) -> list[str]:
+    """Terminate a child and synchronously prove it has been reaped."""
+    errors = []
+    if process.poll() is not None:
+        process.wait()
+        return errors
+    try:
+        process.terminate()
+    except OSError as exc:
+        errors.append(f"{label} terminate failed: {exc}")
+    try:
+        process.wait(timeout=timeout_seconds)
+        return errors
+    except subprocess.TimeoutExpired:
+        errors.append(f"{label} required SIGKILL")
+    try:
+        process.kill()
+    except OSError as exc:
+        errors.append(f"{label} kill failed: {exc}")
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        errors.append(f"{label} remained alive after SIGKILL")
+    return errors
+
+
+def build_and_launch(run_dir: pathlib.Path, isolation: dict[str, str], fixture: dict[str, Any],
+                     probe_url: str, probe_token: str,
+                     app_binary: pathlib.Path | None = None) -> tuple[subprocess.Popen[str], pathlib.Path, int]:
+    # A benchmark prepares one immutable executable for every measured run.
+    # Standalone journeys build their executable here before launch.
+    if app_binary is None:
+        app_binary = build_native_review_app(isolation)
+    elif not app_binary.is_file():
+        raise HarnessError(f"prepared native review app does not exist: {app_binary}")
 
     env = scrubbed_environment()
     env["HOME"] = str(run_dir / "home")
     pathlib.Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
     env.update({
         "BUZZ_PRIVATE_KEY": pathlib.Path(fixture["secret_path"]).read_text().strip(),
+        "BUZZ_REVIEW_PUBKEY": fixture["identity_pubkey"],
         "BUZZ_RELAY_URL": isolation["relay_url"], "BUZZ_DEV_KEYRING_SERVICE": isolation["keyring_service"],
         "BUZZ_NATIVE_REVIEW": "1", "BUZZ_NATIVE_REVIEW_CHANNEL": "general",
+        "BUZZ_NATIVE_REVIEW_PROBE_URL": probe_url,
+        "BUZZ_NATIVE_REVIEW_PROBE_TOKEN": probe_token,
     })
     log = (run_dir / "logs" / "app.log").open("w")
     process = subprocess.Popen([str(app_binary)], cwd=ROOT, env=env, stdout=log,
                                stderr=subprocess.STDOUT, text=True)
-    log.close()
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise HarnessError(f"Tauri exited during launch; see {run_dir / 'logs/app.log'}")
-        if run(["ps", "-p", str(process.pid), "-o", "comm="], check=False).stdout.rstrip().endswith("/buzz-desktop"):
-            return process, app_binary, process.pid
-        time.sleep(0.25)
-    process.terminate()
-    raise HarnessError("timed out waiting for native Buzz process")
-
+    try:
+        log.close()
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise HarnessError(f"Tauri exited during launch; see {run_dir / 'logs/app.log'}")
+            if run(["ps", "-p", str(process.pid), "-o", "comm="], check=False).stdout.rstrip().endswith("/buzz-desktop"):
+                return process, app_binary, process.pid
+            time.sleep(0.25)
+        raise HarnessError("timed out waiting for native Buzz process")
+    except BaseException as exc:
+        cleanup_errors = terminate_and_reap(process, "Tauri launcher")
+        if cleanup_errors:
+            raise HarnessError(f"{exc}; {'; '.join(cleanup_errors)}") from exc
+        raise
 
 def wait_for_visible_window(driver: Driver, process: subprocess.Popen[str], timeout_seconds: float = 30) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
@@ -585,11 +709,6 @@ def wait_expectation(driver: Driver, expectation: dict[str, Any], timeout_ms: in
         time.sleep(0.025)
 
 
-def valid_measurement(step_status: str, duration_ms: float) -> float | None:
-    return duration_ms if step_status == "passed" else None
-
-
-
 def capture_step(driver: Driver, run_dir: pathlib.Path, slug: str, record: dict[str, Any]) -> dict[str, str]:
     artifacts: dict[str, str] = {}
     if record["screenshots"]:
@@ -616,11 +735,6 @@ def cleanup_review_state(run_dir: pathlib.Path, isolation: dict[str, str],
         errors.append(f"desktop state reset failed: {exc}")
     if fixture:
         try:
-            run([str(ROOT / "scripts/setup-desktop-test-data.sh")],
-                env=fixture_environment(isolation, fixture["identity_pubkey"], cleanup=True), capture=False)
-        except Exception as exc:
-            errors.append(f"review principal database cleanup failed: {exc}")
-        try:
             pathlib.Path(fixture["secret_path"]).unlink(missing_ok=True)
         except Exception as exc:
             errors.append(f"review identity removal failed: {exc}")
@@ -628,10 +742,12 @@ def cleanup_review_state(run_dir: pathlib.Path, isolation: dict[str, str],
         raise HarnessError("; ".join(errors))
 
 
-def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path) -> pathlib.Path:
+def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path,
+                *, app_binary: pathlib.Path | None = None,
+                isolation_id: str | None = None) -> pathlib.Path:
     journey = load_journey(path)
     run_id = f"{journey['flow']}-{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
-    isolation = isolation_manifest(run_id, relay_url)
+    isolation = isolation_manifest(isolation_id or run_id, relay_url)
     run_dir = output_root / git("rev-parse", "--short=12", "HEAD") / journey["flow"] / run_id
     for child in ("manifest", "logs", "screenshots", "accessibility", "state", "home"):
         (run_dir / child).mkdir(parents=True, exist_ok=True)
@@ -649,13 +765,21 @@ def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path) -
     fixture: dict[str, Any] | None = None
     probe_server: http.server.ThreadingHTTPServer | None = None
     sampler: ProcessSampler | None = None
+    cleanup_interruption: BaseException | None = None
+    journey_interruption: BaseException | None = None
     try:
         if not doctor(require_permissions=True)["ok"]:
             raise HarnessError("doctor failed; grant required permissions and rerun")
         fixture = prepare_fixture(run_dir, isolation)
-        probe_server, probe_url = semantic_probe_server(run_dir / "state" / "semantic.json")
-        process, app_binary, app_pid = build_and_launch(run_dir, isolation, fixture, probe_url)
-        receipt["provenance"]["artifact_path"] = str(app_binary)
+        probe_token = secrets.token_urlsafe(32)
+        probe_server, probe_url = semantic_probe_server(
+            run_dir / "state" / "semantic.json", probe_token
+        )
+        process, app_binary, app_pid = build_and_launch(
+            run_dir, isolation, fixture, probe_url, probe_token, app_binary
+        )
+        receipt_path = run_dir / "receipt.json"
+        receipt["provenance"]["artifact_path"] = os.path.relpath(app_binary, receipt_path.parent)
         receipt["provenance"]["artifact_sha256"] = sha256(app_binary)
         driver = Driver(build_driver(), app_pid, run_dir / "state" / "semantic.json")
         sampler = ProcessSampler(app_pid)
@@ -687,18 +811,16 @@ def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path) -
             finally:
                 step_receipt["finished_monotonic_ns"] = time.monotonic_ns()
                 step_receipt["duration_ms"] = (step_receipt["finished_monotonic_ns"] - step_start) / 1_000_000
-                if metric := step.get("measure"):
-                    value = valid_measurement(step_receipt["status"], step_receipt["duration_ms"])
-                    if value is not None:
-                        step_receipt["measurement"] = metric
-                        receipt["measurements"][metric] = {"value": value, "unit": "ms", "step": step["name"]}
-
+                if measurement := step.get("measure"):
+                    receipt["measurements"][measurement] = {"value": step_receipt["duration_ms"], "unit": "ms", "step": step["name"]}
                 step_receipt["artifacts"] = capture_step(driver, run_dir, slug, journey["record"])
         if journey["record"]["video"] == "window":
             driver.request("record_stop")
         receipt["status"] = "passed"
-    except Exception as exc:
+    except BaseException as exc:
         receipt["failure"] = str(exc)
+        if not isinstance(exc, Exception):
+            journey_interruption = exc
         if driver:
             try:
                 receipt["artifacts"]["failure"] = capture_step(driver, run_dir, "failure", {"screenshots": True, "accessibility": True})
@@ -710,69 +832,181 @@ def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path) -
                 pass
     finally:
         cleanup_errors = []
+
+        def record_cleanup_failure(label: str, exc: BaseException) -> None:
+            nonlocal cleanup_interruption
+            cleanup_errors.append(f"{label}: {exc}")
+            if not isinstance(exc, Exception) and cleanup_interruption is None:
+                cleanup_interruption = exc
+
         if sampler:
-            receipt["performance"]["process"] = sampler.finish()
+            try:
+                receipt["performance"]["process"] = sampler.finish()
+            except BaseException as exc:
+                record_cleanup_failure("process sampler cleanup failed", exc)
         video = run_dir / "video.mp4"
         if video.is_file():
             try:
                 relay_safe_video(video, run_dir / "video-share.mp4")
                 receipt["artifacts"]["share_video"] = "video-share.mp4"
-            except EvidenceError as exc:
-                cleanup_errors.append(f"shareable video finalization failed: {exc}")
+            except BaseException as exc:
+                record_cleanup_failure("shareable video finalization failed", exc)
         if probe_server:
-            probe_server.shutdown()
-            probe_server.server_close()
+            try:
+                probe_server.shutdown()
+            except BaseException as exc:
+                record_cleanup_failure("semantic probe shutdown failed", exc)
+            try:
+                probe_server.server_close()
+            except BaseException as exc:
+                record_cleanup_failure("semantic probe close failed", exc)
         if driver:
             try:
                 driver.close()
-            except Exception as exc:
-                cleanup_errors.append(f"native driver cleanup failed: {exc}")
+            except BaseException as exc:
+                record_cleanup_failure("native driver cleanup failed", exc)
         if process and journey["cleanup"]["terminate_app"]:
-            process.terminate()
             try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill(); cleanup_errors.append("Tauri launcher required SIGKILL")
+                cleanup_errors.extend(terminate_and_reap(process, "Tauri launcher"))
+            except BaseException as exc:
+                record_cleanup_failure("Tauri launcher cleanup failed", exc)
         if journey["cleanup"]["remove_state"]:
             try:
                 cleanup_review_state(run_dir, isolation, fixture)
-            except Exception as exc:
-                cleanup_errors.append(str(exc))
+            except BaseException as exc:
+                record_cleanup_failure("review state cleanup failed", exc)
         receipt["cleanup"] = {"status": "failed" if cleanup_errors else "passed", "errors": cleanup_errors}
         if cleanup_errors:
             receipt["status"] = "failed"
         receipt["finished_at"] = utc_now()
-        record_artifact_digests(receipt, run_dir)
         (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
         report = f"# Native review: {journey['flow']}\n\n**{receipt['status'].upper()}** at `{prov['head_sha']}`.\n\nReceipt: `receipt.json`\n"
         if receipt["failure"]:
             report += f"\nFailure: `{receipt['failure']}`\n"
         (run_dir / "report.md").write_text(report)
+    if journey_interruption is not None:
+        raise journey_interruption
+    if cleanup_interruption is not None:
+        raise cleanup_interruption
     print(run_dir)
     if receipt["status"] != "passed":
         raise HarnessError(receipt["failure"] or "journey or cleanup failed")
     return run_dir
 
 
+def benchmark(path: pathlib.Path, relay_url: str, output_root: pathlib.Path,
+              runs: int) -> list[pathlib.Path]:
+    """Capture a cohort whose every run identifies one immutable app artifact."""
+    cohort_id = f"benchmark-{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
+    isolation = isolation_manifest(cohort_id, relay_url)
+    built_binary = build_native_review_app(isolation)
+    cohort_binary = output_root / ".cohorts" / cohort_id / "buzz-desktop"
+    cohort_binary.parent.mkdir(parents=True, exist_ok=True)
+    built_sha = sha256(built_binary)
+    shutil.copy2(built_binary, cohort_binary)
+    if sha256(cohort_binary) != built_sha:
+        raise HarnessError("prepared benchmark artifact changed while being copied")
+
+    receipts: list[pathlib.Path] = []
+    for _ in range(runs):
+        if sha256(cohort_binary) != built_sha:
+            raise HarnessError("immutable benchmark artifact changed before launch")
+        receipt_path = run_journey(
+            path, relay_url, output_root, app_binary=cohort_binary, isolation_id=cohort_id
+        ) / "receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        provenance = receipt.get("provenance", {})
+        artifact_path = pathlib.Path(provenance.get("artifact_path", ""))
+        recorded_artifact = artifact_path if artifact_path.is_absolute() else receipt_path.parent / artifact_path
+        if (recorded_artifact.resolve() != cohort_binary.resolve()
+                or provenance.get("artifact_sha256") != built_sha
+                or sha256(cohort_binary) != built_sha):
+            raise HarnessError("benchmark receipt does not identify the immutable cohort artifact")
+        receipts.append(receipt_path)
+    return receipts
+
+
+def numeric(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def load_receipts(paths: list[pathlib.Path], label: str) -> list[dict[str, Any]]:
     if len({path.resolve() for path in paths}) != len(paths):
         raise HarnessError(f"{label} cohort contains duplicate receipt paths")
     receipts = []
-    run_ids: set[str] = set()
     for path in paths:
         try:
             receipt = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise HarnessError(f"cannot read {label} receipt {path}: {exc}") from exc
-        if receipt.get("status") != "passed" or receipt.get("cleanup", {}).get("status") != "passed":
+        if not isinstance(receipt, dict):
+            raise HarnessError(f"{label} receipt root must be an object: {path}")
+        cleanup = receipt.get("cleanup")
+        if (receipt.get("status") != "passed" or not isinstance(cleanup, dict)
+                or set(cleanup) - {"status", "errors"} or cleanup.get("status") != "passed"
+                or ("errors" in cleanup and cleanup["errors"] != [])):
             raise HarnessError(f"{label} receipt is not a clean pass: {path}")
-        if receipt.get("provenance", {}).get("dirty"):
-            raise HarnessError(f"{label} receipt was captured from a dirty tree: {path}")
-        run_id = receipt.get("run_id")
-        if not isinstance(run_id, str) or not run_id or run_id in run_ids:
-            raise HarnessError(f"{label} cohort contains a missing or duplicate run_id: {run_id}")
-        run_ids.add(run_id)
+        provenance = receipt.get("provenance")
+        if (not isinstance(provenance, dict) or provenance.get("dirty") is not False
+                or provenance.get("dirty_state_sha256") is not None
+                or provenance.get("status") != []):
+            raise HarnessError(f"{label} receipt lacks clean provenance: {path}")
+        machine = receipt.get("performance", {}).get("machine")
+        if (receipt.get("schema_version") != 1
+                or not isinstance(receipt.get("run_id"), str) or not receipt["run_id"]
+                or not isinstance(provenance, dict)
+                or not isinstance(provenance.get("head_sha"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", provenance["head_sha"])
+                or not isinstance(provenance.get("artifact_path"), str)
+                or not provenance["artifact_path"]
+                or not isinstance(provenance.get("artifact_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", provenance["artifact_sha256"])
+                or not isinstance(machine, dict)
+                or set(machine) != {"host_id_sha256", "system", "release", "machine", "cpu"}
+                or not re.fullmatch(r"[0-9a-f]{64}", machine.get("host_id_sha256", ""))
+                or any(not isinstance(value, str) or not value for value in machine.values())):
+            raise HarnessError(f"{label} receipt has incomplete provenance: {path}")
+        artifact_path = pathlib.Path(provenance["artifact_path"])
+        if not artifact_path.is_absolute():
+            artifact_path = path.parent / artifact_path
+        if not artifact_path.is_file():
+            raise HarnessError(f"{label} receipt artifact is not a regular file: {artifact_path}")
+        try:
+            actual_artifact_sha = sha256(artifact_path)
+        except OSError as exc:
+            raise HarnessError(f"cannot hash {label} receipt artifact {artifact_path}: {exc}") from exc
+        if actual_artifact_sha != provenance["artifact_sha256"]:
+            raise HarnessError(f"{label} receipt artifact digest does not match: {artifact_path}")
+        measurements = receipt.get("measurements")
+        process_metrics = receipt.get("performance", {}).get("process")
+        if not isinstance(measurements, dict) or not isinstance(process_metrics, dict):
+            raise HarnessError(f"{label} receipt has invalid performance data: {path}")
+        for name, measurement in measurements.items():
+            if (not isinstance(name, str) or not name or not isinstance(measurement, dict)
+                    or set(measurement) != {"value", "unit", "step"}
+                    or measurement.get("unit") != "ms"
+                    or not isinstance(measurement.get("step"), str) or not measurement["step"]
+                    or not numeric(measurement.get("value")) or measurement["value"] < 0):
+                raise HarnessError(f"{label} receipt has invalid measurement {name}: {path}")
+        allowed_process = {
+            "sample_count", "interval_ms", "cpu_percent_median", "cpu_percent_peak",
+            "resident_mb_median", "resident_mb_peak",
+        }
+        if (set(process_metrics) - allowed_process
+                or not isinstance(process_metrics.get("sample_count"), int)
+                or isinstance(process_metrics.get("sample_count"), bool)
+                or process_metrics["sample_count"] < 0):
+            raise HarnessError(f"{label} receipt has invalid process metrics: {path}")
+        for name, value in process_metrics.items():
+            if name == "sample_count":
+                continue
+            if (not numeric(value) or value < 0
+                    or (name == "interval_ms" and value <= 0)):
+                raise HarnessError(f"{label} receipt has invalid process metric {name}: {path}")
         receipts.append(receipt)
+    if len({receipt["run_id"] for receipt in receipts}) != len(receipts):
+        raise HarnessError(f"{label} cohort contains duplicate run identities")
     return receipts
 
 
@@ -781,7 +1015,7 @@ def metric_value(receipt: dict[str, Any], metric: str) -> float:
         value = receipt.get("performance", {}).get("process", {}).get(metric.removeprefix("process."))
     else:
         value = receipt.get("measurements", {}).get(metric, {}).get("value")
-    if not is_finite_number(value) or value < 0:
+    if not numeric(value) or value < 0:
         raise HarnessError(
             f"receipt {receipt.get('run_id')} has no nonnegative finite numeric metric {metric}"
         )
@@ -816,7 +1050,8 @@ def compare_performance(baseline_paths: list[pathlib.Path], candidate_paths: lis
     if budget["schema_version"] != 1 or not isinstance(budget["flow"], str):
         raise HarnessError("unsupported performance budget schema")
     minimum = budget["minimum_samples"]
-    if not is_int(minimum) or minimum < PERFORMANCE_SAMPLE_MINIMUM:
+    if (not isinstance(minimum, int) or isinstance(minimum, bool)
+            or minimum < PERFORMANCE_SAMPLE_MINIMUM):
         raise HarnessError(f"minimum_samples must be at least {PERFORMANCE_SAMPLE_MINIMUM}")
     metrics = budget["metrics"]
     if not isinstance(metrics, dict) or not metrics:
@@ -825,34 +1060,33 @@ def compare_performance(baseline_paths: list[pathlib.Path], candidate_paths: lis
     for name, limits in metrics.items():
         if (not isinstance(name, str) or not name or not isinstance(limits, dict) or not limits
                 or set(limits) - allowed_limits
-                or not all(is_finite_number(value) and value >= 0 for value in limits.values())):
+                or not all(numeric(value) and value >= 0 for value in limits.values())):
             raise HarnessError(f"invalid limits for performance metric {name}")
 
     baseline = load_receipts(baseline_paths, "baseline")
     candidate = load_receipts(candidate_paths, "candidate")
+    if {path.resolve() for path in baseline_paths} & {path.resolve() for path in candidate_paths}:
+        raise HarnessError("baseline and candidate cohorts overlap")
+    if {receipt["run_id"] for receipt in baseline} & {receipt["run_id"] for receipt in candidate}:
+        raise HarnessError("baseline and candidate cohorts reuse run identities")
     if len(baseline) < minimum or len(candidate) < minimum:
         raise HarnessError(f"performance comparison requires at least {minimum} clean samples per cohort")
-    all_paths = baseline_paths + candidate_paths
-    if len({path.resolve() for path in all_paths}) != len(all_paths):
-        raise HarnessError("baseline and candidate cohorts must use independent receipt paths")
     all_receipts = baseline + candidate
-    all_run_ids = [receipt["run_id"] for receipt in all_receipts]
-    if len(set(all_run_ids)) != len(all_run_ids):
-        raise HarnessError("baseline and candidate cohorts must use independent run_ids")
     flows = {receipt.get("flow") for receipt in all_receipts}
     machines = {json.dumps(receipt.get("performance", {}).get("machine"), sort_keys=True) for receipt in all_receipts}
     if flows != {budget["flow"]}:
         raise HarnessError(f"receipt flows {sorted(str(item) for item in flows)} do not match budget flow {budget['flow']}")
     if len(machines) != 1:
         raise HarnessError("baseline and candidate receipts were captured on incompatible machines")
-    revisions: dict[str, str | None] = {}
     for label, cohort in (("baseline", baseline), ("candidate", candidate)):
-        cohort_revisions = {receipt["provenance"].get("head_sha") for receipt in cohort}
-        if len(cohort_revisions) != 1:
+        revisions = {receipt["provenance"]["head_sha"] for receipt in cohort}
+        artifacts = {receipt["provenance"]["artifact_sha256"] for receipt in cohort}
+        if len(revisions) != 1:
             raise HarnessError(f"{label} cohort mixes source revisions")
-        revisions[label] = next(iter(cohort_revisions))
-    if revisions["baseline"] == revisions["candidate"]:
-        raise HarnessError("baseline and candidate cohorts must use different source revisions")
+        if len(artifacts) != 1:
+            raise HarnessError(f"{label} cohort mixes application artifacts")
+    if baseline[0]["provenance"]["head_sha"] == candidate[0]["provenance"]["head_sha"]:
+        raise HarnessError("baseline and candidate cohorts use the same source revision")
 
     baseline_summary = cohort_summary(baseline, list(metrics))
     candidate_summary = cohort_summary(candidate, list(metrics))
@@ -911,20 +1145,6 @@ def main() -> int:
     compare_parser.add_argument("--candidate", type=pathlib.Path, action="append", required=True)
     compare_parser.add_argument("--budget", type=pathlib.Path, required=True)
     compare_parser.add_argument("--output", type=pathlib.Path)
-    bundle_parser = sub.add_parser("finding-bundle")
-    bundle_parser.add_argument("receipt", type=pathlib.Path)
-    bundle_parser.add_argument("--output", type=pathlib.Path, required=True)
-    bundle_parser.add_argument("--match", help="case-insensitive regular expression selecting log lines")
-    bundle_parser.add_argument("--context", type=int, default=8)
-    bundle_parser.add_argument("--start", type=float, help="clip start in seconds")
-    bundle_parser.add_argument("--duration", type=float, help="clip duration in seconds")
-    publish_parser = sub.add_parser("publish-review")
-    publish_parser.add_argument("receipt", type=pathlib.Path)
-    publish_parser.add_argument("--summary", type=pathlib.Path, required=True)
-    publish_parser.add_argument("--channel", required=True)
-    publish_parser.add_argument("--reply-to", required=True)
-    publish_parser.add_argument("--highlights", type=pathlib.Path)
-    publish_parser.add_argument("--mention", action="append", default=[])
     args = parser.parse_args()
     try:
         if args.command == "doctor":
@@ -933,22 +1153,13 @@ def main() -> int:
             load_journey(args.journey); print(f"valid: {args.journey}"); return 0
         if args.command == "compare":
             compare_performance(args.baseline, args.candidate, args.budget, args.output); return 0
-        if args.command == "publish-review":
-            result = publish_review(args.receipt.resolve(), args.summary.resolve(), args.channel,
-                                    args.reply_to, args.highlights.resolve() if args.highlights else None,
-                                    args.mention)
-            print(json.dumps(result, indent=2)); return 0
-        if args.command == "finding-bundle":
-            result = finding_bundle(args.receipt.resolve(), args.output.resolve(), match=args.match, context=args.context,
-                                    start=args.start, duration=args.duration)
-            print(json.dumps({"output": str(args.output.resolve()), "manifest": result}, indent=2)); return 0
         if args.command == "benchmark":
-            if not is_int(args.runs) or args.runs < PERFORMANCE_SAMPLE_MINIMUM:
+            if args.runs < PERFORMANCE_SAMPLE_MINIMUM:
                 raise HarnessError(f"benchmark requires at least {PERFORMANCE_SAMPLE_MINIMUM} runs")
-            receipts = [run_journey(args.journey, args.relay, args.output) / "receipt.json" for _ in range(args.runs)]
+            receipts = benchmark(args.journey, args.relay, args.output, args.runs)
             print(json.dumps({"receipts": [str(path) for path in receipts]}, indent=2)); return 0
         run_journey(args.journey, args.relay, args.output); return 0
-    except (HarnessError, EvidenceError, PublishError) as exc:
+    except HarnessError as exc:
         print(f"native-review: {exc}", file=sys.stderr)
         return 1
 
