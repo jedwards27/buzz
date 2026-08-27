@@ -52,6 +52,10 @@ class EvidenceBundleTests(unittest.TestCase):
                 "cleanup": {"status": "passed", "errors": [{"token": "nested-secret"}]},
                 "isolation": {"secret_path": "/private/path"},
             }
+            receipt["artifact_digests"] = {
+                "video.mp4": evidence.sha256(root / "video.mp4"),
+                "flutter.log": evidence.sha256(root / "flutter.log"),
+            }
             receipt_path = root / "receipt.json"
             receipt_path.write_text(json.dumps(receipt))
             output = root / "bundle"
@@ -161,13 +165,30 @@ class EvidenceBundleTests(unittest.TestCase):
             (root / "flutter.log").write_text("ordinary output\n")
             receipt_path = root / "receipt.json"
             receipt_path.write_text(json.dumps({
-                "provenance": {}, "artifacts": {"video": "video.mp4", "log": "flutter.log"}
+                "provenance": {}, "artifacts": {"video": "video.mp4", "log": "flutter.log"},
+                "artifact_digests": {
+                    "video.mp4": evidence.sha256(root / "video.mp4"),
+                    "flutter.log": evidence.sha256(root / "flutter.log"),
+                },
             }))
             output = root / "bundle"
             with mock.patch.object(evidence, "relay_safe_video", side_effect=lambda _s, d, **_k: d.write_bytes(b"v") or d):
                 with self.assertRaisesRegex(evidence.EvidenceError, "found no lines"):
                     evidence.finding_bundle(receipt_path, output, match="missing")
             self.assertFalse(output.exists())
+
+    def test_bundle_rejects_artifact_replaced_after_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "video.mp4").write_bytes(b"original")
+            (root / "flutter.log").write_text("original log")
+            receipt = {"artifacts": {"video": "video.mp4", "log": "flutter.log"}}
+            evidence.record_artifact_digests(receipt, root)
+            receipt_path = root / "receipt.json"
+            receipt_path.write_text(json.dumps(receipt))
+            (root / "video.mp4").write_bytes(b"replacement")
+            with self.assertRaisesRegex(evidence.EvidenceError, "digest does not match"):
+                evidence.finding_bundle(receipt_path, root / "bundle")
 
     def test_existing_output_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:

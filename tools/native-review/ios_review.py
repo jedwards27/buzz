@@ -21,7 +21,7 @@ if str(_TOOL_ROOT) not in sys.path:
 import time
 from typing import Any
 
-from evidence_bundle import EvidenceError, relay_safe_video
+from evidence_bundle import EvidenceError, record_artifact_digests, relay_safe_video
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_TEST = ROOT / "mobile/integration_test/native_review_pairing_test.dart"
@@ -234,6 +234,7 @@ def run_review(test: pathlib.Path, device_name: str, output_root: pathlib.Path) 
         if errors:
             receipt["status"] = "failed"
         receipt["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        record_artifact_digests(receipt, run_dir)
         (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2, allow_nan=False) + "\n")
     print(run_dir)
     if receipt["status"] != "passed":

@@ -14,6 +14,7 @@
     "provenance",
     "isolation",
     "artifacts",
+    "artifact_digests",
     "steps",
     "cleanup",
     "measurements",
@@ -99,6 +100,13 @@
         "process": {
           "type": "object"
         }
+      }
+    },
+    "artifact_digests": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
       }
     }
   }

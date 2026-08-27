@@ -16,6 +16,7 @@ SECRET_HEADER = re.compile(
     r"(?im)(?P<prefix>^[^\r\n]*?\b(?:authorization|proxy[-_]authorization)\s*[:=]\s*)"
     r"[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*"
 )
+NSEC_TOKEN = re.compile(r"(?i)(?<![a-z0-9])nsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}(?![a-z0-9])")
 SECRET_VALUE = re.compile(
     r"(?i)(?P<name>[\"']?(?:auth|token|secret|password|private[_-]?key|cookie|api[_-]?key)[A-Z0-9_.-]*[\"']?)"
     r"(?P<sep>\s*[:=]\s*)"
@@ -33,6 +34,41 @@ def sha256(path: pathlib.Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def artifact_path(run_dir: pathlib.Path, name: str) -> pathlib.Path:
+    candidate = (run_dir / name).resolve()
+    if run_dir.resolve() not in candidate.parents or not candidate.is_file():
+        raise EvidenceError(f"artifact is missing or escapes receipt directory: {name}")
+    return candidate
+
+
+def record_artifact_digests(receipt: dict[str, Any], run_dir: pathlib.Path) -> None:
+    """Bind every receipt-declared file artifact to its final bytes."""
+    digests: dict[str, str] = {}
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str):
+            candidate = (run_dir / value).resolve()
+            if run_dir.resolve() in candidate.parents and candidate.is_file():
+                digests[value] = sha256(candidate)
+    visit(receipt.get("artifacts", {}))
+    receipt["artifact_digests"] = dict(sorted(digests.items()))
+
+
+def verify_artifact(receipt: dict[str, Any], run_dir: pathlib.Path, name: str) -> pathlib.Path:
+    path = artifact_path(run_dir, name)
+    expected = receipt.get("artifact_digests", {}).get(name)
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise EvidenceError(f"receipt has no valid digest for artifact: {name}")
+    if sha256(path) != expected:
+        raise EvidenceError(f"artifact digest does not match receipt: {name}")
+    return path
 
 
 def relay_safe_video(source: pathlib.Path, destination: pathlib.Path, *, start: float | None = None,
@@ -78,7 +114,8 @@ def redact_log(text: str) -> str:
         quote = value[0] if value and value[0] in {"\"", "'"} else ""
         return f"{match.group('name')}{match.group('sep')}{quote}[REDACTED]{quote}"
     text = SECRET_HEADER.sub(lambda match: f"{match.group('prefix')}[REDACTED]", text)
-    return SECRET_VALUE.sub(replacement, text)
+    text = SECRET_VALUE.sub(replacement, text)
+    return NSEC_TOKEN.sub("[REDACTED]", text)
 
 
 def redact_value(value: Any) -> Any:
@@ -133,21 +170,22 @@ def finding_bundle(receipt_path: pathlib.Path, output: pathlib.Path, *, match: s
     log_name = receipt["artifacts"].get("log")
     if not isinstance(video_name, str) or not isinstance(log_name, str):
         raise EvidenceError("finding bundles require receipt video and log artifacts")
-    def artifact(name: str) -> pathlib.Path:
-        candidate = (run_dir / name).resolve()
-        if run_dir.resolve() not in candidate.parents:
-            raise EvidenceError(f"artifact escapes receipt directory: {name}")
-        return candidate
+    source_receipt_sha256 = sha256(receipt_path)
+    video = verify_artifact(receipt, run_dir, video_name)
+    log = verify_artifact(receipt, run_dir, log_name)
 
     output.mkdir(parents=True)
     try:
-        relay_safe_video(artifact(video_name), output / "finding.mp4", start=start, duration=duration)
-        log_text = artifact(log_name).read_text(errors="replace")
+        relay_safe_video(video, output / "finding.mp4", start=start, duration=duration)
+        log_text = log.read_text(errors="replace")
         (output / "log-excerpt.txt").write_text(focused_log(log_text, match, context))
         provenance = receipt.get("provenance", {})
         device = receipt.get("isolation", {}).get("simulator", receipt.get("device", {}))
         receipt_copy = redact_value({
             "schema_version": receipt.get("schema_version"),
+            "source_receipt_sha256": source_receipt_sha256,
+            "source_artifact_digests": {video_name: receipt["artifact_digests"][video_name],
+                                        log_name: receipt["artifact_digests"][log_name]},
             "run_id": receipt.get("run_id"),
             "flow": receipt.get("flow"),
             "status": receipt.get("status"),
@@ -162,6 +200,9 @@ def finding_bundle(receipt_path: pathlib.Path, output: pathlib.Path, *, match: s
         manifest = {
             "schema_version": 1,
             "source_receipt": f"{run_dir.name}/receipt.json",
+            "source_receipt_sha256": source_receipt_sha256,
+            "source_artifact_digests": {video_name: receipt["artifact_digests"][video_name],
+                                        log_name: receipt["artifact_digests"][log_name]},
             "head_sha": receipt.get("provenance", {}).get("head_sha"),
             "dirty": receipt.get("provenance", {}).get("dirty"),
             "status": receipt.get("status"),

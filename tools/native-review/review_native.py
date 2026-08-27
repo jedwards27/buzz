@@ -29,7 +29,7 @@ import time
 import urllib.parse
 from typing import Any
 
-from evidence_bundle import EvidenceError, finding_bundle, relay_safe_video
+from evidence_bundle import EvidenceError, finding_bundle, record_artifact_digests, relay_safe_video
 import review_publish
 from review_publish import PublishError, publish_review
 
@@ -722,6 +722,7 @@ def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path) -
         if cleanup_errors:
             receipt["status"] = "failed"
         receipt["finished_at"] = utc_now()
+        record_artifact_digests(receipt, run_dir)
         (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2))
         report = f"# Native review: {journey['flow']}\n\n**{receipt['status'].upper()}** at `{prov['head_sha']}`.\n\nReceipt: `receipt.json`\n"
         if receipt["failure"]:
@@ -822,9 +823,14 @@ def compare_performance(baseline_paths: list[pathlib.Path], candidate_paths: lis
         raise HarnessError(f"receipt flows {sorted(str(item) for item in flows)} do not match budget flow {budget['flow']}")
     if len(machines) != 1:
         raise HarnessError("baseline and candidate receipts were captured on incompatible machines")
+    revisions: dict[str, str | None] = {}
     for label, cohort in (("baseline", baseline), ("candidate", candidate)):
-        if len({receipt["provenance"].get("head_sha") for receipt in cohort}) != 1:
+        cohort_revisions = {receipt["provenance"].get("head_sha") for receipt in cohort}
+        if len(cohort_revisions) != 1:
             raise HarnessError(f"{label} cohort mixes source revisions")
+        revisions[label] = next(iter(cohort_revisions))
+    if revisions["baseline"] == revisions["candidate"]:
+        raise HarnessError("baseline and candidate cohorts must use different source revisions")
 
     baseline_summary = cohort_summary(baseline, list(metrics))
     candidate_summary = cohort_summary(candidate, list(metrics))

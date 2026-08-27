@@ -456,6 +456,15 @@ metrics:
                 review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
 
 
+    def test_comparison_rejects_equal_baseline_and_candidate_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            baseline = [self.receipt(root / f"b{i}.json", "same", 100) for i in range(3)]
+            candidate = [self.receipt(root / f"c{i}.json", "same", 100) for i in range(3)]
+            with self.assertRaisesRegex(review_native.HarnessError, "different source revisions"):
+                review_native.compare_performance(baseline, candidate, self.budget(root / "budget.yaml"))
+
+
 class PublishReviewTests(unittest.TestCase):
     def inputs(self, root):
         video = root / "video-share.mp4"
@@ -466,6 +475,7 @@ class PublishReviewTests(unittest.TestCase):
             "provenance": {"dirty": False, "head_sha": "a" * 40},
             "cleanup": {"status": "passed"},
             "artifacts": {"share_video": video.name},
+            "artifact_digests": {video.name: review_native.sha256(video)},
         }))
         summary = root / "summary.md"
         summary.write_text("Found a regression.")
@@ -515,6 +525,15 @@ class PublishReviewTests(unittest.TestCase):
                     highlights.write_text(json.dumps([{"seconds": value, "text": "invalid"}]))
                     with self.assertRaisesRegex(review_native.PublishError, "within the video"):
                         review_native.publish_review(receipt, summary, "channel", "thread", highlights)
+
+    @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
+    def test_rejects_share_video_replaced_after_receipt(self, _which):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            receipt, summary = self.inputs(root)
+            (root / "video-share.mp4").write_bytes(b"replacement")
+            with self.assertRaisesRegex(review_native.PublishError, "digest does not match"):
+                review_native.publish_review(receipt, summary, "channel", "thread")
 
     @mock.patch.object(review_native.review_publish.shutil, "which", return_value="/usr/bin/tool")
     def test_rejects_dirty_receipt_before_upload(self, _which):

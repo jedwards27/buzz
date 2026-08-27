@@ -9,6 +9,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from evidence_bundle import EvidenceError, verify_artifact
+
 
 class PublishError(RuntimeError):
     pass
@@ -124,7 +126,10 @@ def publish_review(receipt_path: pathlib.Path, summary_path: pathlib.Path, chann
     share_name = receipt.get("artifacts", {}).get("share_video")
     if not isinstance(share_name, str):
         raise PublishError("receipt has no relay-safe share video")
-    video = _artifact(receipt_path.parent, share_name)
+    try:
+        video = verify_artifact(receipt, receipt_path.parent, share_name)
+    except EvidenceError as exc:
+        raise PublishError(str(exc)) from exc
     duration = _video_duration(video)
     highlights = _load_highlights(highlights_path, duration)
     evidence = (
