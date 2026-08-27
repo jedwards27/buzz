@@ -19,11 +19,19 @@ import shutil
 import statistics
 import subprocess
 import sys
+
+_TOOL_ROOT = pathlib.Path(__file__).resolve().parent
+if str(_TOOL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TOOL_ROOT))
 import tempfile
 import threading
 import time
 import urllib.parse
 from typing import Any
+
+from evidence_bundle import EvidenceError, finding_bundle, record_artifact_digests, relay_safe_video
+import review_publish
+from review_publish import PublishError, publish_review
 
 try:
     import yaml
