@@ -429,9 +429,14 @@ pub fn run() {
 
             try_regenerate_nest(&app_handle);
 
-            if let Some(mgr) = huddle::models::global_model_manager() {
-                mgr.start_stt_download(state.http_client.clone());
-                mgr.start_tts_download(state.http_client.clone());
+            // Native-review runs use a disposable HOME and must reach the reviewed UI
+            // without downloading hundreds of megabytes of unrelated voice models.
+            // Production and ordinary development launches retain eager warmup.
+            if std::env::var("BUZZ_NATIVE_REVIEW").as_deref() != Ok("1") {
+                if let Some(mgr) = huddle::models::global_model_manager() {
+                    mgr.start_stt_download(state.http_client.clone());
+                    mgr.start_tts_download(state.http_client.clone());
+                }
             }
 
             // Handle deep link URLs received while the app is running (macOS)
