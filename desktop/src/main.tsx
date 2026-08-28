@@ -199,4 +199,8 @@ async function bootstrap() {
   renderApp();
 }
 
-void bootstrap();
+void bootstrap().catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error("Buzz bootstrap failed", error);
+  document.body.textContent = `Buzz bootstrap failed: ${message}`;
+});
