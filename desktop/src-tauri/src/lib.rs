@@ -28,6 +28,7 @@ mod migration;
 mod model_tests;
 mod models;
 mod native_relay_client;
+mod native_review;
 mod native_websocket;
 mod native_websocket_batch;
 mod nostr_bind;
@@ -597,6 +598,7 @@ pub fn run() {
             get_presence,
             get_os_idle_seconds,
             get_default_relay_url,
+            native_review::get_native_review_bootstrap,
             auto_connect_default_relay_enabled,
             get_legacy_workspace_storage,
             is_shared_identity,

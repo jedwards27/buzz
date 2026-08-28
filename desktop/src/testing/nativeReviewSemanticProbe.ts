@@ -87,17 +87,12 @@ function snapshot(): SemanticNode[] {
   return nodes;
 }
 
-export function installNativeReviewSemanticProbe(): void {
+export function installNativeReviewSemanticProbe(probeUrl: string): void {
   let scheduled = false;
   const publish = () => {
     scheduled = false;
     const payload = JSON.stringify(snapshot());
-    if (
-      !navigator.sendBeacon(
-        import.meta.env.VITE_NATIVE_REVIEW_PROBE_URL,
-        payload,
-      )
-    ) {
+    if (!navigator.sendBeacon(probeUrl, payload)) {
       console.error("native review semantic probe beacon was rejected");
     }
   };

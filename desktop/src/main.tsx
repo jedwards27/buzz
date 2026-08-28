@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import { App } from "@/app/App";
 import { RootErrorBoundary } from "@/app/RootErrorBoundary";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
@@ -34,7 +35,13 @@ const ONBOARDING_COMPLETION_STORAGE_KEY_PREFIX = "buzz-onboarding-complete.v1:";
 const DEV_STATE_RESET_PARAM = "resetDevState";
 const NATIVE_REVIEW_PARAM = "nativeReview";
 
-function configureNativeReviewFixtureFromUrl() {
+type NativeReviewBootstrap = {
+  relayUrl: string;
+  pubkey: string;
+  probeUrl: string;
+};
+
+async function configureNativeReviewFixtureFromUrl() {
   const buildEnabled = import.meta.env.VITE_NATIVE_REVIEW === "1";
   if (!import.meta.env.DEV && !buildEnabled) return;
   const url = new URL(window.location.href);
@@ -42,15 +49,23 @@ function configureNativeReviewFixtureFromUrl() {
     url.searchParams.get(NATIVE_REVIEW_PARAM) === "1" || buildEnabled;
   if (!enabled) return;
 
+  const runtime = buildEnabled
+    ? await invoke<NativeReviewBootstrap>("get_native_review_bootstrap")
+    : undefined;
   const relayUrl =
+    runtime?.relayUrl ??
     url.searchParams.get("reviewRelay") ??
     import.meta.env.VITE_NATIVE_REVIEW_RELAY;
   const pubkey =
+    runtime?.pubkey ??
     url.searchParams.get("reviewPubkey") ??
     import.meta.env.VITE_NATIVE_REVIEW_PUBKEY;
+  const probeUrl =
+    runtime?.probeUrl ?? import.meta.env.VITE_NATIVE_REVIEW_PROBE_URL;
   if (
     !relayUrl ||
     !pubkey ||
+    !probeUrl ||
     !/^(ws|http):\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?$/.test(
       relayUrl,
     )
@@ -78,7 +93,7 @@ function configureNativeReviewFixtureFromUrl() {
     `buzz-community-onboarding-complete.v1:${encodeURIComponent(relayUrl)}:${pubkey}`,
     "true",
   );
-  installNativeReviewSemanticProbe();
+  installNativeReviewSemanticProbe(probeUrl);
 }
 
 function resetDevWebviewStateFromUrl() {
@@ -173,7 +188,7 @@ async function installE2eBridgeIfConfigured() {
 
 async function bootstrap() {
   resetDevWebviewStateFromUrl();
-  configureNativeReviewFixtureFromUrl();
+  await configureNativeReviewFixtureFromUrl();
   configureDevE2eBridgeFromUrl();
   recoverLocalStorageQuotaOnStartup();
   initializeConversationDensityPreference();
