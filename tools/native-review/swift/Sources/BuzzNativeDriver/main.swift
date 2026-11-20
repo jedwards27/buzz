@@ -3,6 +3,7 @@ import ApplicationServices
 import AVFoundation
 import CoreGraphics
 import Foundation
+import Darwin
 import BuzzNativeDriverSupport
 
 struct Locator: Codable {
@@ -288,29 +289,58 @@ func windowStatus(pid: pid_t) -> [String: Any] {
     }
 }
 
-/// Move the app's window onto the main display when it opened elsewhere (a fresh
-/// VM can have a second display left of the main one, where WKWebView exposes no
-/// accessibility tree). Returns whether the window moved.
-func placeWindowOnMainDisplay(app: AXUIElement) throws -> Bool {
-    guard let window = (attribute(app, kAXWindowsAttribute) as? [AXUIElement])?.first,
-          let current = frameAttribute(window) else {
-        throw DriverError.message("no accessibility window to place")
+/// Move the window the harness reports (`windowInfo`, the largest on-screen one)
+/// onto the main display when it opened elsewhere (a fresh VM can have a second
+/// display left of the main one, where WKWebView exposes no accessibility tree).
+/// The accessibility window moved is the one whose frame matches the reported
+/// window, never "the first"; the result is read back from the window server and
+/// the call fails unless the reported window ends up wholly on the main display.
+func placeWindowOnMainDisplay(app: AXUIElement, pid: pid_t) throws -> [String: Any] {
+    let (windowID, reported) = try windowInfo(pid: pid)
+    let windows = (attribute(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+    let frames = windows.map { window -> CGRect in
+        guard let frame = frameAttribute(window) else { return .null }
+        return CGRect(x: frame.x, y: frame.y, width: frame.width, height: frame.height)
     }
-    let frame = CGRect(x: current.x, y: current.y, width: current.width, height: current.height)
-    guard let target = placementOnMainDisplay(window: frame, mainDisplay: CGDisplayBounds(CGMainDisplayID())) else {
-        return false
+    guard let index = matchingWindowIndex(frames: frames, reported: reported) else {
+        throw DriverError.message("no accessibility window to place matches the reported window \(windowID) at \(reported)")
     }
-    var size = target.size
-    var origin = target.origin
-    guard let sizeValue = AXValueCreate(.cgSize, &size), let originValue = AXValueCreate(.cgPoint, &origin) else {
-        throw DriverError.message("could not encode window placement")
+    let window = windows[index]
+    let mainDisplay = CGDisplayBounds(CGMainDisplayID())
+    var moved = false
+    if let target = placementOnMainDisplay(window: reported, mainDisplay: mainDisplay) {
+        var size = target.size
+        var origin = target.origin
+        guard let sizeValue = AXValueCreate(.cgSize, &size), let originValue = AXValueCreate(.cgPoint, &origin) else {
+            throw DriverError.message("could not encode window placement")
+        }
+        // Size first so the window cannot be clamped against the display it is leaving.
+        guard AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue) == .success,
+              AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, originValue) == .success else {
+            throw DriverError.message("accessibility refused to move the window; grant Accessibility to the invoking process")
+        }
+        moved = true
     }
-    // Size first so the window cannot be clamped against the display it is leaving.
-    guard AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue) == .success,
-          AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, originValue) == .success else {
-        throw DriverError.message("accessibility refused to move the window; grant Accessibility to the invoking process")
+    // Read it back from the window server, the same source the harness reports from.
+    var after = reported
+    var verified = false
+    for _ in 0..<20 {
+        if let (_, current) = try? windowInfo(pid: pid) { after = current }
+        verified = windowIsOnMainDisplay(after, mainDisplay: mainDisplay)
+        if verified { break }
+        Thread.sleep(forTimeInterval: 0.1)
     }
-    return true
+    guard verified else {
+        throw DriverError.message("window \(windowID) is at \(after) after placement, not wholly on the main display \(mainDisplay)")
+    }
+    func rect(_ value: CGRect) -> [String: Double] {
+        ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
+    }
+    return [
+        "ok": true, "moved": moved, "verified": true, "window_id": windowID,
+        "before": rect(reported), "after": rect(after), "main_display": rect(mainDisplay),
+        "accessibility_windows": windows.count,
+    ]
 }
 
 func captureWindow(pid: pid_t, path: String) throws {
@@ -525,7 +555,7 @@ func ensureTargetFrontmost(pid: pid_t) async throws {
     }
     if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
         // A first-run macOS privacy prompt keeps focus until answered.
-        _ = answerPrivacyPrompt(excluding: pid)
+        _ = answerPrivacyPrompt(target: pid)
         running.activate(options: [.activateIgnoringOtherApps])
     }
     let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -579,60 +609,111 @@ func postText(_ text: String, pid: pid_t) throws {
     }
 }
 
-/// Press `button` in a system alert whose text contains `hint` (for example the
-/// one-time macOS "Local Network" prompt, which blocks input to every app until
-/// answered). Scans every on-screen window owner, never the reviewed app, and
-/// presses only when the hint text is present so no unrelated "Allow" is clicked.
-func pressSystemAlertButton(button: String, hint: String) -> Bool {
-    let owners = Set(((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? [])
-        .compactMap { $0[kCGWindowOwnerPID as String] as? Int32 })
-    for pid in owners where pid != getpid() {
-        let app = AXUIElementCreateApplication(pid)
-        for window in (attribute(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
-            var queue = [window]
-            var texts: [String] = []
-            var target: AXUIElement?
-            var visited = 0
-            while !queue.isEmpty && visited < 500 {
-                let current = queue.removeFirst()
-                visited += 1
-                if let text = elementName(current) { texts.append(text) }
-                if normalizedRole(elementRole(current)) == "button", let name = elementName(current), normalizedButtonTitle(name) == normalizedButtonTitle(button) { target = current }
-                queue.append(contentsOf: children(current))
-            }
-            if let target, texts.joined(separator: " ").lowercased().contains(hint.lowercased()) {
-                return AXUIElementPerformAction(target, kAXPressAction as CFString) == .success
+/// Names a privacy prompt may legitimately use for this review: the processes in
+/// the driver's own ancestry (macOS names the responsible process, such as the
+/// agent that launched the run, or an interpreter), the reviewed app, and any
+/// `extra` names the caller launched on purpose (a trigger child).
+func reviewProcessNames(target: pid_t?, extra: [String]) -> [String] {
+    var names = Set(extra)
+    func add(pid: pid_t) {
+        var path = [CChar](repeating: 0, count: 4096)
+        if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
+            let url = URL(fileURLWithPath: String(cString: path))
+            names.insert(url.lastPathComponent)
+            for component in url.pathComponents where component.hasSuffix(".app") {
+                names.insert(String(component.dropLast(4)))
             }
         }
+        var name = [CChar](repeating: 0, count: 256)
+        if proc_name(pid, &name, UInt32(name.count)) > 0 { names.insert(String(cString: name)) }
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            if let localized = app.localizedName { names.insert(localized) }
+        }
     }
-    return false
+    var pid = getpid()
+    var hops = 0
+    while pid > 1 && hops < 32 {
+        add(pid: pid)
+        var info = proc_bsdinfo()
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 else { break }
+        pid = pid_t(info.pbi_ppid)
+        hops += 1
+    }
+    if let target { add(pid: target) }
+    names.remove("")
+    return Array(names)
 }
 
-/// Answer a pending first-run macOS privacy prompt (see `privacyPromptButton`).
-/// Returns whether a button was pressed.
-func answerPrivacyPrompt(excluding target: pid_t? = nil) -> Bool {
+/// Every on-screen window owned by the system prompt agent, as the decision
+/// function sees it, with its accessibility element. Scans only that owner, never
+/// the reviewed app or anyone else.
+func systemPromptWindows() -> [(PromptWindow, AXUIElement)] {
     let owners = Set(((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? [])
         .compactMap { $0[kCGWindowOwnerPID as String] as? Int32 })
-    for pid in owners where pid != getpid() && pid != target {
+    var windows: [(PromptWindow, AXUIElement)] = []
+    for pid in owners where pid != getpid() {
+        guard let running = NSRunningApplication(processIdentifier: pid),
+              running.bundleIdentifier == systemPromptBundleID else { continue }
         let app = AXUIElementCreateApplication(pid)
         for window in (attribute(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
-            var queue = [window]
-            var texts: [String] = []
-            var buttons: [String: AXUIElement] = [:]
-            var visited = 0
-            while !queue.isEmpty && visited < 500 {
-                let current = queue.removeFirst()
-                visited += 1
-                if let text = elementName(current) { texts.append(text) }
-                if normalizedRole(elementRole(current)) == "button", let name = elementName(current) { buttons[normalizedButtonTitle(name)] = current }
-                queue.append(contentsOf: children(current))
-            }
-            if let name = privacyPromptButton(forAlertText: texts.joined(separator: " ")), let button = buttons[normalizedButtonTitle(name)] {
-                return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
-            }
+            windows.append((promptWindow(window, owner: running), window))
         }
     }
-    return false
+    return windows
+}
+
+func promptWindow(_ window: AXUIElement, owner: NSRunningApplication) -> PromptWindow {
+    var queue = [window]
+    var texts: [String] = []
+    var buttons: [String] = []
+    var visited = 0
+    while !queue.isEmpty && visited < 200 {
+        let current = queue.removeFirst()
+        visited += 1
+        if normalizedRole(elementRole(current)) == "button" {
+            if let name = elementName(current) { buttons.append(name) }
+        } else if let text = stringAttribute(current, [kAXValueAttribute]) {
+            texts.append(text)
+        }
+        queue.append(contentsOf: children(current))
+    }
+    return PromptWindow(
+        ownerBundleID: owner.bundleIdentifier,
+        ownerExecutablePath: owner.executableURL?.path,
+        role: stringAttribute(window, [kAXRoleAttribute]),
+        subrole: stringAttribute(window, [kAXSubroleAttribute]),
+        texts: texts,
+        buttons: buttons)
+}
+
+/// Answer a pending first-run macOS privacy prompt, but only one that is positively
+/// the system's own alert naming a process of this review (see
+/// `decidePrivacyPrompt`). Returns what was done; a skipped window is reported with
+/// its reason and nothing is pressed.
+func answerPrivacyPrompt(target: pid_t? = nil, extraNames: [String] = []) -> [String: Any] {
+    let expected = reviewProcessNames(target: target, extra: extraNames)
+    var skipped: [String] = []
+    for (candidate, element) in systemPromptWindows() {
+        switch decidePrivacyPrompt(candidate, expectedApps: expected) {
+        case .skip(let reason):
+            skipped.append(reason)
+        case .press(let title):
+            var queue = [element]
+            var visited = 0
+            while !queue.isEmpty && visited < 200 {
+                let current = queue.removeFirst()
+                visited += 1
+                if normalizedRole(elementRole(current)) == "button", let name = elementName(current),
+                   normalizedButtonTitle(name) == normalizedButtonTitle(title) {
+                    let pressed = AXUIElementPerformAction(current, kAXPressAction as CFString) == .success
+                    return ["ok": true, "answered": pressed, "button": title, "prompt": candidate.texts.first ?? ""]
+                }
+                queue.append(contentsOf: children(current))
+            }
+            skipped.append("could not find the \(title) button to press")
+        }
+    }
+    return ["ok": true, "answered": false, "skipped": skipped]
 }
 
 @main
@@ -640,7 +721,7 @@ struct BuzzNativeDriver {
     static func main() async {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
-            guard let command = arguments.first else { throw DriverError.message("usage: buzz-native-driver doctor | serve --pid PID | press-system-alert-button --button NAME --contains TEXT") }
+            guard let command = arguments.first else { throw DriverError.message("usage: buzz-native-driver doctor | serve --pid PID | answer-privacy-prompt [--expect NAME]...") }
             if command == "doctor" {
                 let accessibility = AXIsProcessTrusted()
                 let screen = CGPreflightScreenCaptureAccess()
@@ -652,12 +733,20 @@ struct BuzzNativeDriver {
                 ]])
                 return
             }
-            if command == "press-system-alert-button" {
-                guard arguments.count == 5, arguments[1] == "--button", arguments[3] == "--contains" else {
-                    throw DriverError.message("usage: buzz-native-driver press-system-alert-button --button NAME --contains TEXT")
+            if command == "answer-privacy-prompt" {
+                // answer-privacy-prompt [--expect NAME]...: NAME is a process the caller launched
+                // on purpose to raise the prompt (for example dns-sd or ffmpeg).
+                var extra: [String] = []
+                var rest = Array(arguments.dropFirst())
+                while !rest.isEmpty {
+                    guard rest.count >= 2, rest[0] == "--expect" else {
+                        throw DriverError.message("usage: buzz-native-driver answer-privacy-prompt [--expect NAME]...")
+                    }
+                    extra.append(rest[1])
+                    rest.removeFirst(2)
                 }
                 guard AXIsProcessTrusted() else { throw DriverError.message("Accessibility permission is not granted") }
-                response(["ok": true, "pressed": pressSystemAlertButton(button: arguments[2], hint: arguments[4])])
+                response(answerPrivacyPrompt(extraNames: extra))
                 return
             }
             guard command == "serve", (arguments.count == 3 || arguments.count == 5), arguments[1] == "--pid", let pid = pid_t(arguments[2]) else {
@@ -790,9 +879,9 @@ struct BuzzNativeDriver {
                         }
                         response(["ok": true])
                     case "place_window":
-                        response(["ok": true, "moved": try placeWindowOnMainDisplay(app: app)])
+                        response(try placeWindowOnMainDisplay(app: app, pid: pid))
                     case "answer_privacy_prompt":
-                        response(["ok": true, "answered": answerPrivacyPrompt(excluding: pid)])
+                        response(answerPrivacyPrompt(target: pid))
                     case "web_ready":
                         response(["ok": true, "ready": semanticContentBounds(pid: pid, messagingTimeout: 1.5) != nil])
                     case "window_status":

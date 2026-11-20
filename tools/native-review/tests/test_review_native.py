@@ -638,7 +638,9 @@ class JourneyTests(unittest.TestCase):
         driver.request.side_effect = [
             {"ok": True, "visible": True, "window_id": 7},
             {"ok": True, "answered": False},
-            {"ok": True, "moved": True},
+            {"ok": True, "moved": True, "verified": True, "window_id": 7,
+             "before": {"x": -1016, "y": 36, "width": 1008, "height": 726},
+             "after": {"x": 40, "y": 60, "width": 1008, "height": 726}},
             {"ok": True, "answered": False},
             {"ok": True, "ready": False},
             {"ok": True, "answered": True},
@@ -653,6 +655,25 @@ class JourneyTests(unittest.TestCase):
                           "answer_privacy_prompt", "web_ready", "window_status"])
         self.assertTrue(status["moved"])
         self.assertEqual(status["bounds"]["x"], 40)
+        # The receipt records what was moved and where it ended up.
+        self.assertTrue(status["placement"]["verified"])
+        self.assertEqual(status["placement"]["before"]["x"], -1016)
+        self.assertEqual(status["placement"]["after"]["x"], 40)
+
+    def test_interactive_window_fails_when_placement_is_not_verified(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
+            {"ok": True, "moved": True, "verified": False,
+             "before": {"x": -1016, "y": 36, "width": 1008, "height": 726},
+             "after": {"x": -1016, "y": 36, "width": 1008, "height": 726}},
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            with self.assertRaisesRegex(review_native.HarnessError, "not verified"):
+                review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
 
     def test_interactive_window_waits_for_the_accessibility_window_to_exist(self):
         driver = mock.Mock()

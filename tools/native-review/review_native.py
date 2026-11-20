@@ -705,6 +705,10 @@ def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
         # The accessibility window can lag the compositor's by a moment.
         try:
             placement = driver.request("place_window")
+            if not placement.get("verified", True):
+                raise HarnessError(
+                    f"window placement was not verified: before {placement.get('before')}, "
+                    f"after {placement.get('after')}")
             break
         except HarnessError as error:
             if "no accessibility window" not in str(error):
@@ -726,7 +730,7 @@ def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
                 f"(window status: {status})")
         time.sleep(0.1)
     placed = driver.request("window_status")
-    return {**placed, "moved": bool(placement.get("moved"))}
+    return {**placed, "moved": bool(placement.get("moved")), "placement": placement}
 
 
 def locate_required(driver: Driver, locators: list[dict[str, str]], timeout_ms: int) -> dict[str, Any]:

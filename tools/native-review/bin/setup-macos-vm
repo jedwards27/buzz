@@ -17,13 +17,20 @@
 #     the run: triggers each and answers it through the Accessibility-trusted native driver
 #     (best effort, see README).
 #
+# Safety: it refuses to run outside a virtual machine (kern.hv_vmm_present must be 1)
+# unless --allow-non-vm is passed, because it starts services on fixed ports and the
+# relay script resets the harness database. Every service it starts is identified by
+# a pidfile under the state dir; a port that is already open but not ours is never
+# reused, and the schema reset is refused unless Postgres is the one started here
+# (see check-harness-database).
+#
 # Nothing here copies, creates or prints a secret. The Postgres/MinIO
 # credentials are the public dev constants already hard-coded in
 # docker-compose.harness.yml and review_native.fixture_environment.
 #
 # Usage:
 #   tools/native-review/bin/setup-macos-vm [--state-dir DIR] [--no-relay]
-#                                            [--skip-prompts]
+#                                            [--skip-prompts] [--allow-non-vm]
 #   . "$STATE_DIR/env.sh"          # then: tools/native-review/bin/review-native run ...
 set -euo pipefail
 
@@ -33,11 +40,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 STATE_DIR="${BUZZ_NATIVE_REVIEW_STATE_DIR:-$HOME/.buzz-native-review}"
 START_RELAY=1
 ANSWER_PROMPTS=1
+ALLOW_NON_VM=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --no-relay) START_RELAY=0; shift ;;
     --skip-prompts) ANSWER_PROMPTS=0; shift ;;
+    --allow-non-vm) ALLOW_NON_VM=1; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -54,19 +63,39 @@ DB_USER=buzz
 DB_PASS=buzz_dev
 DB_NAME=buzz
 BUCKET=buzz-media
-# dl.min.io is may be unreachable from a locked-down VM; build a pinned upstream commit instead.
+# dl.min.io may be unreachable from a locked-down VM; build a pinned upstream commit instead.
 MINIO_REF="${MINIO_REF:-7aac2a2c5b7c}"
 
 log() { printf '[setup-macos-vm] %s\n' "$*"; }
 die() { printf '[setup-macos-vm] ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] || die "this script is for Apple-silicon macOS"
+# Refuse outside a VM before touching anything. kern.hv_vmm_present is 1 under
+# Apple's Virtualization framework (Tart, ec2-macos workstations); hw.model is
+# VirtualMac2,1 there too.
+vmm_present="$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)"
+if [[ "$vmm_present" != "1" ]]; then
+  ((ALLOW_NON_VM)) || die "refusing to run: this does not look like a virtual machine (kern.hv_vmm_present=$vmm_present, hw.model=$(sysctl -n hw.model 2>/dev/null || echo unknown)). It starts services on fixed local ports and resets a database; pass --allow-non-vm if you really mean to run it here."
+  log "WARNING: not a VM (kern.hv_vmm_present=$vmm_present); continuing because --allow-non-vm was given"
+fi
 command -v brew >/dev/null || die "Homebrew is required"
 command -v go >/dev/null || die "Go is required to build MinIO (brew install go)"
 mkdir -p "$STATE_DIR"/{logs,sherpa} "$HOME/.local/bin"
+# Marks this directory (and everything under it) as the harness's own.
+printf 'buzz-native-review-harness\n' > "$STATE_DIR/.buzz-native-review-harness"
 BREW_PREFIX="$(brew --prefix)"
 
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+listener_pids() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+# An open port is ours only when its sole listener is the pid recorded in the pidfile
+# this script's own service wrote. Anything else is someone else's: never use it.
+require_ours() {
+  local name="$1" port="$2" pidfile="$3" want
+  want="$(head -1 "$pidfile" 2>/dev/null || true)"
+  if [[ -z "$want" || "$(listener_pids "$port")" != "$want" ]]; then
+    die "$name port :$port is already in use by something this script did not start (listener pid: $(listener_pids "$port")); refusing to use it. Stop it or free the port."
+  fi
+}
 wait_port() {
   local name="$1" port="$2"
   for _ in $(seq 1 60); do port_open "$port" && return 0; sleep 1; done
@@ -101,7 +130,9 @@ if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
   "$PG_BIN/initdb" -D "$PGDATA" -U "$DB_USER" --auth=scram-sha-256 --pwfile="$pwfile" -E UTF8 >/dev/null
   rm -f "$pwfile"
 fi
-if ! port_open "$PG_PORT"; then
+if port_open "$PG_PORT"; then
+  require_ours postgres "$PG_PORT" "$PGDATA/postmaster.pid"
+else
   log "starting postgres on :$PG_PORT"
   "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$STATE_DIR/logs/postgres.log" \
     -o "-p $PG_PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=$STATE_DIR" -w start >/dev/null
@@ -112,24 +143,36 @@ if ! psql -h 127.0.0.1 -p "$PG_PORT" -U "$DB_USER" -d postgres -qtAc \
   log "createdb $DB_NAME"
   createdb -h 127.0.0.1 -p "$PG_PORT" -U "$DB_USER" "$DB_NAME"
 fi
+# The cluster is the one initdb'd under the state dir above, so this database is ours:
+# mark it, then prove it. The relay script runs the same check before it resets the schema.
+psql -h 127.0.0.1 -p "$PG_PORT" -U "$DB_USER" -d postgres -qc \
+  "COMMENT ON DATABASE $DB_NAME IS 'buzz-native-review-harness'"
+"$SCRIPT_DIR/check-harness-database" --state-dir "$STATE_DIR" --port "$PG_PORT" --db "$DB_NAME" --user "$DB_USER" \
+  || die "Postgres on :$PG_PORT is not the harness database"
 
 # -- 4. Redis on :6471 ------------------------------------------------------
-if ! port_open "$REDIS_PORT"; then
+if port_open "$REDIS_PORT"; then
+  require_ours redis "$REDIS_PORT" "$STATE_DIR/redis/redis.pid"
+else
   log "starting redis on :$REDIS_PORT"
   mkdir -p "$STATE_DIR/redis"
   "$REDIS_SERVER" --port "$REDIS_PORT" --bind 127.0.0.1 --dir "$STATE_DIR/redis" \
+    --pidfile "$STATE_DIR/redis/redis.pid" \
     --save "" --daemonize yes --logfile "$STATE_DIR/logs/redis.log" >/dev/null
   wait_port redis "$REDIS_PORT"
 fi
 
 # -- 5. MinIO on :9471 + bucket ---------------------------------------------
-if ! port_open "$MINIO_PORT"; then
+if port_open "$MINIO_PORT"; then
+  require_ours minio "$MINIO_PORT" "$STATE_DIR/minio.pid"
+else
   log "starting minio on :$MINIO_PORT"
   mkdir -p "$STATE_DIR/minio"
   MINIO_ROOT_USER="$DEV_USER" MINIO_ROOT_PASSWORD="$DEV_SECRET" \
     nohup "$MINIO_BIN" server "$STATE_DIR/minio" --address "127.0.0.1:$MINIO_PORT" \
     --console-address "127.0.0.1:$MINIO_CONSOLE_PORT" \
     > "$STATE_DIR/logs/minio.log" 2>&1 < /dev/null &
+  echo $! > "$STATE_DIR/minio.pid"
   wait_port minio "$MINIO_PORT"
 fi
 # Create the media bucket with a SigV4-signed PUT (no `mc` needed). 200 = created,
@@ -165,12 +208,15 @@ fi
 # -- 8. isolated relay (native services, no Docker) -------------------------
 if ((START_RELAY)); then
   if port_open 3030; then
+    # Only the relay this script's relay script started (a tmux session of that name) is ours.
+    tmux has-session -t dawn-relay 2>/dev/null \
+      || die "port :3030 is in use by something that is not the harness relay; refusing to use it"
     log "relay already listening on :3030"
   else
     log "starting isolated relay (first build takes several minutes)"
     # shellcheck disable=SC1091
     ( cd "$REPO_ROOT" && . bin/activate-hermit >/dev/null \
-      && BUZZ_HARNESS_NATIVE_SERVICES=1 RELAY_LOG="$STATE_DIR/logs/relay.log" \
+      && BUZZ_HARNESS_NATIVE_SERVICES=1 BUZZ_HARNESS_STATE_DIR="$STATE_DIR" RELAY_LOG="$STATE_DIR/logs/relay.log" \
          SHERPA_ONNX_ARCHIVE_DIR="$STATE_DIR/sherpa" ./scripts/start-isolated-test-relay.sh )
   fi
 fi

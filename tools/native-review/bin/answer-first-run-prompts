@@ -8,6 +8,11 @@
 # this only has to succeed once. Exits 0 when a prompt was answered or never
 # appeared; nonzero only if the driver could not run.
 #
+# The driver presses a button only when it can positively identify the window as
+# the system's own privacy alert (owned by the system prompt agent, a system
+# dialog) that names a process of this run: this script's ancestry, the reviewed
+# app, or the trigger it launched here. Anything else is left alone and logged.
+#
 #   Local Network -> Allow
 #   Microphone    -> Don't Allow (a review never records audio)
 set -euo pipefail
@@ -17,32 +22,37 @@ if [[ ! -x "$DRIVER" ]]; then
   swift build -c release --package-path "$SCRIPT_DIR/swift" >/dev/null
 fi
 
-# answer LABEL BUTTON HINT COMMAND...
+# answer LABEL TRIGGER_NAME COMMAND...
 answer() {
-  local label="$1" button="$2" hint="$3"
-  shift 3
+  local label="$1" trigger_name="$2"
+  shift 2
   "$@" >/dev/null 2>&1 &
   local trigger=$!
-  local pressed=0
+  local pressed=0 skipped=""
   for _ in $(seq 1 20); do
-    if "$DRIVER" press-system-alert-button --button "$button" --contains "$hint" | grep -Eq '"pressed" ?: ?true'; then
+    reply="$("$DRIVER" answer-privacy-prompt --expect "$trigger_name")"
+    if grep -Eq '"answered" ?: ?true' <<<"$reply"; then
       pressed=1
+      echo "[answer-first-run-prompts] $label: $reply"
       break
     fi
+    grep -Eq '"skipped" ?: ?\[ ?"' <<<"$reply" && skipped="$reply"
     sleep 0.5
   done
   kill "$trigger" 2>/dev/null || true
   wait "$trigger" 2>/dev/null || true
   if ((pressed)); then
-    echo "[answer-first-run-prompts] $label: pressed $button"
+    :
+  elif [[ -n "$skipped" ]]; then
+    echo "[answer-first-run-prompts] $label: a window was left alone because it could not be identified as this run's prompt: $skipped"
   else
     echo "[answer-first-run-prompts] $label: no prompt appeared (already answered, or not needed)"
   fi
 }
 
-answer "Local Network" "Allow" "local network" dns-sd -B _services._dns-sd._udp local.
+answer "Local Network" dns-sd dns-sd -B _services._dns-sd._udp local.
 if command -v ffmpeg >/dev/null 2>&1; then
-  answer "Microphone" "Don't Allow" "microphone" \
+  answer "Microphone" ffmpeg \
     ffmpeg -hide_banner -loglevel error -f avfoundation -i ":0" -t 1 -f null -
 else
   echo "[answer-first-run-prompts] Microphone: ffmpeg not installed, skipping"
