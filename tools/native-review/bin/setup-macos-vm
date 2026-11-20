@@ -13,8 +13,9 @@
 #   * pub.dev blocked (iOS/Flutter only): when PUB_HOSTED_URL is set in the
 #     environment running this script, it is recorded in env.sh so a later
 #     review-ios run receives the mirror. No mirror URL is hard-coded here.
-#   * A one-time macOS "Local Network" prompt for the process that launches the run: triggers it
-#     and clicks Allow through System Events (best effort, see README).
+#   * One-time macOS "Local Network" and "Microphone" prompts for the process that launches
+#     the run: triggers each and answers it through the Accessibility-trusted native driver
+#     (best effort, see README).
 #
 # Nothing here copies, creates or prints a secret. The Postgres/MinIO
 # credentials are the public dev constants already hard-coded in
@@ -22,7 +23,7 @@
 #
 # Usage:
 #   tools/native-review/bin/setup-macos-vm [--state-dir DIR] [--no-relay]
-#                                            [--skip-local-network]
+#                                            [--skip-prompts]
 #   . "$STATE_DIR/env.sh"          # then: tools/native-review/bin/review-native run ...
 set -euo pipefail
 
@@ -31,12 +32,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 STATE_DIR="${BUZZ_NATIVE_REVIEW_STATE_DIR:-$HOME/.buzz-native-review}"
 START_RELAY=1
-LOCAL_NETWORK=1
+ANSWER_PROMPTS=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --no-relay) START_RELAY=0; shift ;;
-    --skip-local-network) LOCAL_NETWORK=0; shift ;;
+    --skip-prompts) ANSWER_PROMPTS=0; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -174,9 +175,9 @@ if ((START_RELAY)); then
   fi
 fi
 
-# -- 9. macOS "Local Network" prompt ----------------------------------------
-if ((LOCAL_NETWORK)); then
-  "$SCRIPT_DIR/allow-local-network-prompt" || log "Local Network prompt not dismissed automatically; see README"
+# -- 9. macOS first-run privacy prompts --------------------------------------
+if ((ANSWER_PROMPTS)); then
+  "$SCRIPT_DIR/answer-first-run-prompts" || log "first-run prompts not answered automatically; see README"
 fi
 
 log "done. Next: . \"$STATE_DIR/env.sh\" && tools/native-review/bin/review-native doctor --require-permissions"

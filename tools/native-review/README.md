@@ -85,8 +85,10 @@ Postgres/Redis/MinIO natively on the harness ports (5471/6471/9471) under
 starts the isolated relay with `BUZZ_HARNESS_NATIVE_SERVICES=1`; prefetches the
 `sherpa-onnx` archive (a TLS-intercepting proxy breaks that crate's rustls
 downloader with `UnknownIssuer`, so the build reads `SHERPA_ONNX_ARCHIVE_DIR`
-instead); and presses Allow on the one-time macOS "Local Network" prompt
-through the same Accessibility-trusted driver (`bin/allow-local-network-prompt`).
+instead); and answers the one-time macOS "Local Network" (Allow) and "Microphone"
+(Don't Allow) prompts through the same Accessibility-trusted driver
+(`bin/answer-first-run-prompts`). Unanswered, the microphone prompt freezes the
+app's web view.
 
 What it does not do: grant Accessibility or Screen Recording (the invoking
 process needs them; `review-native doctor --require-permissions` checks), install
