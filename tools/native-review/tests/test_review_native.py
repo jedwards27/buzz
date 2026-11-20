@@ -637,15 +637,20 @@ class JourneyTests(unittest.TestCase):
         process.poll.return_value = None
         driver.request.side_effect = [
             {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
             {"ok": True, "moved": True},
+            {"ok": True, "answered": False},
             {"ok": True, "ready": False},
+            {"ok": True, "answered": True},
             {"ok": True, "ready": True},
             {"ok": True, "visible": True, "window_id": 7, "bounds": {"x": 40, "y": 60}},
         ]
         with mock.patch.object(review_native.time, "sleep"):
             status = review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
         self.assertEqual([call.args[0] for call in driver.request.call_args_list],
-                         ["window_status", "place_window", "web_ready", "web_ready", "window_status"])
+                         ["window_status", "answer_privacy_prompt", "place_window",
+                          "answer_privacy_prompt", "web_ready",
+                          "answer_privacy_prompt", "web_ready", "window_status"])
         self.assertTrue(status["moved"])
         self.assertEqual(status["bounds"]["x"], 40)
 
@@ -655,17 +660,22 @@ class JourneyTests(unittest.TestCase):
         process.poll.return_value = None
         driver.request.side_effect = [
             {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
             review_native.HarnessError("no accessibility window to place"),
+            {"ok": True, "answered": False},
             review_native.HarnessError("no accessibility window to place"),
+            {"ok": True, "answered": False},
             {"ok": True, "moved": False},
+            {"ok": True, "answered": False},
             {"ok": True, "ready": True},
             {"ok": True, "visible": True, "window_id": 7, "bounds": {"x": 40, "y": 60}},
         ]
         with mock.patch.object(review_native.time, "sleep"):
             status = review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
         self.assertEqual([call.args[0] for call in driver.request.call_args_list],
-                         ["window_status", "place_window", "place_window", "place_window",
-                          "web_ready", "window_status"])
+                         ["window_status", "answer_privacy_prompt", "place_window",
+                          "answer_privacy_prompt", "place_window", "answer_privacy_prompt",
+                          "place_window", "answer_privacy_prompt", "web_ready", "window_status"])
         self.assertFalse(status["moved"])
 
     def test_interactive_window_does_not_hide_other_placement_errors(self):
@@ -674,6 +684,7 @@ class JourneyTests(unittest.TestCase):
         process.poll.return_value = None
         driver.request.side_effect = [
             {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
             review_native.HarnessError("Accessibility permission is not granted"),
         ]
         with mock.patch.object(review_native.time, "sleep"):

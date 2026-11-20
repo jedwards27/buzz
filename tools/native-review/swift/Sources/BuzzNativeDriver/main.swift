@@ -192,8 +192,10 @@ func describe(_ element: AXUIElement, locator: Locator) -> ElementDescription {
                        focused: boolAttribute(element, kAXFocusedAttribute), frame: frameAttribute(element))
 }
 
-func semanticContentBounds(pid: pid_t) -> CGRect? {
+func semanticContentBounds(pid: pid_t, messagingTimeout: Float? = nil) -> CGRect? {
     let app = AXUIElementCreateApplication(pid)
+    // An app frozen behind a privacy prompt would otherwise stall every query.
+    if let messagingTimeout { AXUIElementSetMessagingTimeout(app, messagingTimeout) }
     enableWebViewAccessibility(app)
     let webArea = find(accessibilityRoots(app: app, pid: pid), locator: Locator(id: nil, role: "web-area", name: nil))
     guard let frame = webArea.flatMap(frameAttribute) else { return nil }
@@ -523,7 +525,7 @@ func ensureTargetFrontmost(pid: pid_t) async throws {
     }
     if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
         // A first-run macOS privacy prompt keeps focus until answered.
-        _ = answerPrivacyPrompt()
+        _ = answerPrivacyPrompt(excluding: pid)
         running.activate(options: [.activateIgnoringOtherApps])
     }
     let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -608,10 +610,10 @@ func pressSystemAlertButton(button: String, hint: String) -> Bool {
 
 /// Answer a pending first-run macOS privacy prompt (see `privacyPromptButton`).
 /// Returns whether a button was pressed.
-func answerPrivacyPrompt() -> Bool {
+func answerPrivacyPrompt(excluding target: pid_t? = nil) -> Bool {
     let owners = Set(((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? [])
         .compactMap { $0[kCGWindowOwnerPID as String] as? Int32 })
-    for pid in owners where pid != getpid() {
+    for pid in owners where pid != getpid() && pid != target {
         let app = AXUIElementCreateApplication(pid)
         for window in (attribute(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
             var queue = [window]
@@ -789,8 +791,10 @@ struct BuzzNativeDriver {
                         response(["ok": true])
                     case "place_window":
                         response(["ok": true, "moved": try placeWindowOnMainDisplay(app: app)])
+                    case "answer_privacy_prompt":
+                        response(["ok": true, "answered": answerPrivacyPrompt(excluding: pid)])
                     case "web_ready":
-                        response(["ok": true, "ready": semanticContentBounds(pid: pid) != nil])
+                        response(["ok": true, "ready": semanticContentBounds(pid: pid, messagingTimeout: 1.5) != nil])
                     case "window_status":
                         response(windowStatus(pid: pid))
                     case "snapshot":

@@ -700,6 +700,8 @@ def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
     status = wait_for_visible_window(driver, process, timeout_seconds)
     deadline = time.monotonic() + timeout_seconds
     while True:
+        # A first-run macOS privacy prompt freezes the web view until answered.
+        driver.request("answer_privacy_prompt")
         # The accessibility window can lag the compositor's by a moment.
         try:
             placement = driver.request("place_window")
@@ -712,7 +714,10 @@ def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
-    while not driver.request("web_ready").get("ready"):
+    while True:
+        driver.request("answer_privacy_prompt")
+        if driver.request("web_ready").get("ready"):
+            break
         if process.poll() is not None:
             raise HarnessError("Tauri exited while waiting for web content accessibility")
         if time.monotonic() >= deadline:
