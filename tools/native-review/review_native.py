@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import hashlib
+import hmac
 import http.server
 import json
 import math
@@ -549,8 +550,14 @@ def semantic_probe_server(path: pathlib.Path, token: str) -> tuple[http.server.T
             self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            if self.path != "/snapshot" or self.headers.get("X-Buzz-Native-Review-Token") != token:
-                self.send_response(404 if self.path != "/snapshot" else 401)
+            target = urllib.parse.urlsplit(self.path)
+            # The page publishes with navigator.sendBeacon, which cannot set request
+            # headers, so the token travels in the probe URL's query; the header is
+            # still accepted for other clients.
+            supplied = (urllib.parse.parse_qs(target.query).get("token") or
+                        [self.headers.get("X-Buzz-Native-Review-Token") or ""])[0]
+            if target.path != "/snapshot" or not hmac.compare_digest(supplied.encode(), token.encode()):
+                self.send_response(404 if target.path != "/snapshot" else 401)
                 self.end_headers()
                 return
             raw_length = self.headers.get("Content-Length")
@@ -581,7 +588,8 @@ def semantic_probe_server(path: pathlib.Path, token: str) -> tuple[http.server.T
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, f"http://127.0.0.1:{server.server_port}/snapshot"
+    query = urllib.parse.urlencode({"token": token})
+    return server, f"http://127.0.0.1:{server.server_port}/snapshot?{query}"
 
 
 def build_native_review_app(isolation: dict[str, str]) -> pathlib.Path:

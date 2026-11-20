@@ -5,6 +5,8 @@ import pathlib
 import re
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "review_native.py"
@@ -742,6 +744,57 @@ class JourneyTests(unittest.TestCase):
             result = review_native.doctor()
         self.assertFalse(result["ok"])
         self.assertIn("ffmpeg", [c["name"] for c in result["checks"] if not c["ok"]])
+
+
+class SemanticProbeServerTests(unittest.TestCase):
+    NODE = {"id": "message-composer", "role": "textbox", "name": "Message", "value": "",
+            "scrollY": 0, "enabled": True, "focused": False,
+            "frame": {"x": 1, "y": 2, "width": 3, "height": 4},
+            "viewport": {"width": 100, "height": 100}}
+
+    def post(self, url, body=None, headers=None):
+        # navigator.sendBeacon sends a plain POST and cannot add request headers.
+        request = urllib.request.Request(
+            url, data=json.dumps(body if body is not None else [self.NODE]).encode(),
+            headers={"Content-Type": "text/plain;charset=UTF-8", **(headers or {})}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            error.close()
+            return error.code
+
+    def serve(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "semantic.json"
+        server, url = review_native.semantic_probe_server(path, "s3cret-token")
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return path, url
+
+    def test_probe_url_carries_the_token_so_a_beacon_is_accepted(self):
+        path, url = self.serve()
+        self.assertIn("token=s3cret-token", url)
+        self.assertEqual(self.post(url), 204)
+        self.assertEqual(json.loads(path.read_text())[0]["id"], "message-composer")
+
+    def test_beacon_without_or_with_the_wrong_token_is_rejected(self):
+        path, url = self.serve()
+        base = url.split("?")[0]
+        self.assertEqual(self.post(base), 401)
+        self.assertEqual(self.post(base + "?token=nope"), 401)
+        self.assertFalse(path.exists())
+
+    def test_header_token_is_still_accepted(self):
+        path, url = self.serve()
+        base = url.split("?")[0]
+        self.assertEqual(self.post(base, headers={"X-Buzz-Native-Review-Token": "s3cret-token"}), 204)
+        self.assertTrue(path.exists())
+
+    def test_unknown_path_is_not_found(self):
+        _, url = self.serve()
+        self.assertEqual(self.post(url.replace("/snapshot", "/other")), 404)
 
 
 class PerformanceTests(unittest.TestCase):
