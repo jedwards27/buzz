@@ -65,6 +65,43 @@ or VM for untrusted changes.
    xcrun simctl list devices available
    ```
 
+### Headless macOS VM without Docker
+
+A cloud or CI Mac usually has a GUI session (Accessibility and Screen Recording
+work) but no Docker, so `scripts/start-isolated-test-relay.sh` cannot start its
+Compose stack. `tools/native-review/bin/setup-macos-vm` is the idempotent
+one-shot for that machine:
+
+```bash
+tools/native-review/bin/setup-macos-vm            # services, relay, prefetch, prompt
+. ~/.buzz-native-review/env.sh                      # PATH + SHERPA_ONNX_ARCHIVE_DIR
+just native-review-desktop tools/native-review/desktop/composer-keyboard.yaml
+```
+
+It installs `postgresql@17`, `redis`, `ffmpeg` and `tmux` with Homebrew; builds a
+pinned MinIO with `go install` (release binaries may be unreachable); runs
+Postgres/Redis/MinIO natively on the harness ports (5471/6471/9471) under
+`~/.buzz-native-review`; creates the `buzz-media` bucket with a SigV4 `curl`;
+starts the isolated relay with `BUZZ_HARNESS_NATIVE_SERVICES=1`; prefetches the
+`sherpa-onnx` archive (a TLS-intercepting proxy breaks that crate's rustls
+downloader with `UnknownIssuer`, so the build reads `SHERPA_ONNX_ARCHIVE_DIR`
+instead); and presses Allow on the one-time macOS "Local Network" prompt
+through the same Accessibility-trusted driver (`bin/allow-local-network-prompt`).
+
+What it does not do: grant Accessibility or Screen Recording (the invoking
+process needs them; `review-native doctor --require-permissions` checks), install
+Homebrew, Go or Xcode, or set up iOS (CocoaPods mirrors, simulators). If your
+network cannot reach pub.dev, export `PUB_HOSTED_URL` before running the setup
+script and `review-ios`; the iOS runner passes it through.
+
+The driver moves the review window onto the main display and waits for WebKit's
+accessibility tree before the first locator. A VM with a second display otherwise
+opens the app there, where the web view exposes no accessibility children.
+If the app cannot take focus because a first-run macOS privacy prompt is up, the
+driver answers it before activating the window: it declines microphone and
+camera access (a review never needs them) and allows Local Network. Other
+alerts are never touched.
+
 ## Run existing journeys
 
 ```bash

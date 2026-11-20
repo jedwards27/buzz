@@ -37,6 +37,8 @@ SIMCTL_TIMEOUT_SECONDS = 30
 SUBPROCESS_ENV_ALLOWLIST = {
     "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME",
     "TERM", "__CF_USER_TEXT_ENCODING", "DEVELOPER_DIR",
+    # Package-mirror override for hosts that cannot reach pub.dev directly.
+    "PUB_HOSTED_URL",
 }
 
 

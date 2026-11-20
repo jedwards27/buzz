@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# One-time (idempotent) setup so `review-native run` works on a macOS VM
+# (a headless cloud Mac).
+#
+# What that machine lacks, and what this script does about it:
+#   * No Docker (a VM without nested virtualization): runs the
+#     isolated relay's Postgres, Redis and MinIO natively on the harness ports
+#     (5471 / 6471 / 9471) and creates the media bucket.
+#   * No ffmpeg: installs it (video-share.mp4 finalization needs it).
+#   * A TLS-intercepting proxy that sherpa-onnx-sys's build script (rustls with
+#     bundled roots) rejects with `UnknownIssuer`: prefetches the archive with
+#     curl and exports SHERPA_ONNX_ARCHIVE_DIR.
+#   * pub.dev blocked (iOS/Flutter only): when PUB_HOSTED_URL is set in the
+#     environment running this script, it is recorded in env.sh so a later
+#     review-ios run receives the mirror. No mirror URL is hard-coded here.
+#   * A one-time macOS "Local Network" prompt for the process that launches the run: triggers it
+#     and clicks Allow through System Events (best effort, see README).
+#
+# Nothing here copies, creates or prints a secret. The Postgres/MinIO
+# credentials are the public dev constants already hard-coded in
+# docker-compose.harness.yml and review_native.fixture_environment.
+#
+# Usage:
+#   tools/native-review/bin/setup-macos-vm [--state-dir DIR] [--no-relay]
+#                                            [--skip-local-network]
+#   . "$STATE_DIR/env.sh"          # then: tools/native-review/bin/review-native run ...
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+STATE_DIR="${BUZZ_NATIVE_REVIEW_STATE_DIR:-$HOME/.buzz-native-review}"
+START_RELAY=1
+LOCAL_NETWORK=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --state-dir) STATE_DIR="$2"; shift 2 ;;
+    --no-relay) START_RELAY=0; shift ;;
+    --skip-local-network) LOCAL_NETWORK=0; shift ;;
+    -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Harness constants (docker-compose.harness.yml, start-isolated-test-relay.sh).
+PG_PORT=5471
+REDIS_PORT=6471
+MINIO_PORT=9471
+MINIO_CONSOLE_PORT=9472
+DEV_USER=buzz_dev
+DEV_SECRET=buzz_dev_secret
+DB_USER=buzz
+DB_PASS=buzz_dev
+DB_NAME=buzz
+BUCKET=buzz-media
+# dl.min.io is may be unreachable from a locked-down VM; build a pinned upstream commit instead.
+MINIO_REF="${MINIO_REF:-7aac2a2c5b7c}"
+
+log() { printf '[setup-macos-vm] %s\n' "$*"; }
+die() { printf '[setup-macos-vm] ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] || die "this script is for Apple-silicon macOS"
+command -v brew >/dev/null || die "Homebrew is required"
+command -v go >/dev/null || die "Go is required to build MinIO (brew install go)"
+mkdir -p "$STATE_DIR"/{logs,sherpa} "$HOME/.local/bin"
+BREW_PREFIX="$(brew --prefix)"
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+wait_port() {
+  local name="$1" port="$2"
+  for _ in $(seq 1 60); do port_open "$port" && return 0; sleep 1; done
+  die "$name did not open :$port (see $STATE_DIR/logs)"
+}
+
+# -- 1. brew packages -------------------------------------------------------
+need=()
+for formula in postgresql@17 redis ffmpeg tmux; do
+  brew list --formula "$formula" >/dev/null 2>&1 || need+=("$formula")
+done
+if ((${#need[@]})); then
+  log "brew install ${need[*]}"
+  HOMEBREW_NO_AUTO_UPDATE=1 brew install "${need[@]}"
+fi
+PG_BIN="$BREW_PREFIX/opt/postgresql@17/bin"
+REDIS_SERVER="$BREW_PREFIX/opt/redis/bin/redis-server"
+export PATH="$PG_BIN:$HOME/.local/bin:$PATH"
+
+# -- 2. MinIO ---------------------------------------------------------------
+MINIO_BIN="$HOME/.local/bin/minio"
+if [[ ! -x "$MINIO_BIN" ]]; then
+  log "go install github.com/minio/minio@$MINIO_REF"
+  GOBIN="$HOME/.local/bin" go install "github.com/minio/minio@$MINIO_REF"
+fi
+
+# -- 3. Postgres on :5471 ---------------------------------------------------
+PGDATA="$STATE_DIR/postgres"
+if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
+  log "initdb $PGDATA"
+  pwfile="$(mktemp)"; printf '%s\n' "$DB_PASS" > "$pwfile"
+  "$PG_BIN/initdb" -D "$PGDATA" -U "$DB_USER" --auth=scram-sha-256 --pwfile="$pwfile" -E UTF8 >/dev/null
+  rm -f "$pwfile"
+fi
+if ! port_open "$PG_PORT"; then
+  log "starting postgres on :$PG_PORT"
+  "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$STATE_DIR/logs/postgres.log" \
+    -o "-p $PG_PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=$STATE_DIR" -w start >/dev/null
+fi
+export PGPASSWORD="$DB_PASS"
+if ! psql -h 127.0.0.1 -p "$PG_PORT" -U "$DB_USER" -d postgres -qtAc \
+     "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+  log "createdb $DB_NAME"
+  createdb -h 127.0.0.1 -p "$PG_PORT" -U "$DB_USER" "$DB_NAME"
+fi
+
+# -- 4. Redis on :6471 ------------------------------------------------------
+if ! port_open "$REDIS_PORT"; then
+  log "starting redis on :$REDIS_PORT"
+  mkdir -p "$STATE_DIR/redis"
+  "$REDIS_SERVER" --port "$REDIS_PORT" --bind 127.0.0.1 --dir "$STATE_DIR/redis" \
+    --save "" --daemonize yes --logfile "$STATE_DIR/logs/redis.log" >/dev/null
+  wait_port redis "$REDIS_PORT"
+fi
+
+# -- 5. MinIO on :9471 + bucket ---------------------------------------------
+if ! port_open "$MINIO_PORT"; then
+  log "starting minio on :$MINIO_PORT"
+  mkdir -p "$STATE_DIR/minio"
+  MINIO_ROOT_USER="$DEV_USER" MINIO_ROOT_PASSWORD="$DEV_SECRET" \
+    nohup "$MINIO_BIN" server "$STATE_DIR/minio" --address "127.0.0.1:$MINIO_PORT" \
+    --console-address "127.0.0.1:$MINIO_CONSOLE_PORT" \
+    > "$STATE_DIR/logs/minio.log" 2>&1 < /dev/null &
+  wait_port minio "$MINIO_PORT"
+fi
+# Create the media bucket with a SigV4-signed PUT (no `mc` needed). 200 = created,
+# 409 = already ours.
+empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  --aws-sigv4 "aws:amz:us-east-1:s3" --user "$DEV_USER:$DEV_SECRET" \
+  -H "x-amz-content-sha256: $empty_sha" "http://127.0.0.1:$MINIO_PORT/$BUCKET")"
+case "$status" in 200|409) log "bucket $BUCKET ready (HTTP $status)" ;; *) die "bucket create failed (HTTP $status)" ;; esac
+
+# -- 6. sherpa-onnx archive (rustls cannot verify a TLS-intercepting proxy) --------
+sherpa_version="$(awk '/^name = "sherpa-onnx-sys"$/ {getline; gsub(/[^0-9.]/, "", $0); print; exit}' "$REPO_ROOT/Cargo.lock")"
+[[ -n "$sherpa_version" ]] || die "could not read sherpa-onnx-sys version from Cargo.lock"
+sherpa_archive="sherpa-onnx-v${sherpa_version}-osx-arm64-static-lib.tar.bz2"
+if [[ ! -s "$STATE_DIR/sherpa/$sherpa_archive" ]] || ! bzip2 -t "$STATE_DIR/sherpa/$sherpa_archive" 2>/dev/null; then
+  log "downloading $sherpa_archive"
+  curl -fsSL --retry 3 -o "$STATE_DIR/sherpa/$sherpa_archive.part" \
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${sherpa_version}/${sherpa_archive}"
+  bzip2 -t "$STATE_DIR/sherpa/$sherpa_archive.part" || die "sherpa archive is not valid bzip2"
+  mv "$STATE_DIR/sherpa/$sherpa_archive.part" "$STATE_DIR/sherpa/$sherpa_archive"
+fi
+
+# -- 7. environment file ----------------------------------------------------
+cat > "$STATE_DIR/env.sh" <<EOF
+# Generated by setup-macos-vm. Source before review-native.
+export PATH="$PG_BIN:$HOME/.local/bin:\$PATH"
+export SHERPA_ONNX_ARCHIVE_DIR="$STATE_DIR/sherpa"
+EOF
+if [[ -n "${PUB_HOSTED_URL:-}" ]]; then
+  printf 'export PUB_HOSTED_URL=%q\n' "$PUB_HOSTED_URL" >> "$STATE_DIR/env.sh"
+fi
+
+# -- 8. isolated relay (native services, no Docker) -------------------------
+if ((START_RELAY)); then
+  if port_open 3030; then
+    log "relay already listening on :3030"
+  else
+    log "starting isolated relay (first build takes several minutes)"
+    # shellcheck disable=SC1091
+    ( cd "$REPO_ROOT" && . bin/activate-hermit >/dev/null \
+      && BUZZ_HARNESS_NATIVE_SERVICES=1 RELAY_LOG="$STATE_DIR/logs/relay.log" \
+         SHERPA_ONNX_ARCHIVE_DIR="$STATE_DIR/sherpa" ./scripts/start-isolated-test-relay.sh )
+  fi
+fi
+
+# -- 9. macOS "Local Network" prompt ----------------------------------------
+if ((LOCAL_NETWORK)); then
+  "$SCRIPT_DIR/allow-local-network-prompt" || log "Local Network prompt not dismissed automatically; see README"
+fi
+
+log "done. Next: . \"$STATE_DIR/env.sh\" && tools/native-review/bin/review-native doctor --require-permissions"

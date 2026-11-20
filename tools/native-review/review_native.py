@@ -329,8 +329,17 @@ def provenance() -> dict[str, Any]:
     }
 
 
+# Host-build settings the Rust build needs on machines behind a TLS-intercepting
+# proxy (sherpa-onnx-sys's build script cannot verify it and reads a prefetched
+# archive instead). They reach host tooling (include_home=True) but never the
+# reviewed app, and secret-shaped names are still dropped.
+HOST_BUILD_PASSTHROUGH = {"SHERPA_ONNX_ARCHIVE_DIR", "SHERPA_ONNX_LIB_DIR"}
+
+
 def scrubbed_environment(*, include_home: bool = False) -> dict[str, str]:
     keep = {"PATH", "TMPDIR", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME", "TERM", "__CF_USER_TEXT_ENCODING"}
+    if include_home:
+        keep |= HOST_BUILD_PASSTHROUGH
     env = {key: value for key, value in os.environ.items() if key in keep and not SECRET_NAME.search(key)}
     env["HOME"] = os.environ.get("HOME", "") if include_home else ""  # isolated per run unless tooling needs host caches
     return env
@@ -434,7 +443,7 @@ class Driver:
 def doctor(require_permissions: bool = False) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     checks.append({"name": "platform", "ok": sys.platform == "darwin", "detail": sys.platform})
-    for command in ("swift", "xcrun", "git"):
+    for command in ("swift", "xcrun", "git", "ffmpeg"):
         path = shutil.which(command)
         checks.append({"name": command, "ok": path is not None, "detail": path or "not found"})
     checks.append({"name": "repository", "ok": (ROOT / "desktop/src-tauri/tauri.conf.json").is_file(), "detail": str(ROOT)})
@@ -445,7 +454,7 @@ def doctor(require_permissions: bool = False) -> dict[str, Any]:
         checks.extend(native.get("checks", []))
     except (HarnessError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         checks.append({"name": "native-driver", "ok": False, "detail": str(exc)})
-    hard_names = {"platform", "swift", "xcrun", "git", "repository", "native-driver-build"}
+    hard_names = {"platform", "swift", "xcrun", "git", "ffmpeg", "repository", "native-driver-build"}
     failed = [c for c in checks if not c.get("ok") and (require_permissions or c.get("name") in hard_names)]
     result = {"ok": not failed, "checks": checks}
     print(json.dumps(result, indent=2))
@@ -672,6 +681,29 @@ def wait_for_visible_window(driver: Driver, process: subprocess.Popen[str], time
     raise HarnessError(f"timed out after {timeout_seconds:g}s waiting for visible native window: {detail}")
 
 
+def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
+                                timeout_seconds: float = 30) -> dict[str, Any]:
+    """Show the window, move it onto the main display, and wait for WebKit's AX tree.
+
+    A fresh macOS VM can open the app on a secondary display whose WKWebView exposes
+    no accessibility children, so locators would never match. Placement is idempotent
+    (a window already on the main display is left alone).
+    """
+    status = wait_for_visible_window(driver, process, timeout_seconds)
+    placement = driver.request("place_window")
+    deadline = time.monotonic() + timeout_seconds
+    while not driver.request("web_ready").get("ready"):
+        if process.poll() is not None:
+            raise HarnessError("Tauri exited while waiting for web content accessibility")
+        if time.monotonic() >= deadline:
+            raise HarnessError(
+                f"timed out after {timeout_seconds:g}s waiting for web content accessibility "
+                f"(window status: {status})")
+        time.sleep(0.1)
+    placed = driver.request("window_status")
+    return {**placed, "moved": bool(placement.get("moved"))}
+
+
 def locate_required(driver: Driver, locators: list[dict[str, str]], timeout_ms: int) -> dict[str, Any]:
     """Wait for a semantic target to materialize, then return the locator used."""
     deadline = time.monotonic() + timeout_ms / 1000
@@ -792,7 +824,7 @@ def run_journey(path: pathlib.Path, relay_url: str, output_root: pathlib.Path,
         driver = Driver(build_driver(), app_pid, run_dir / "state" / "semantic.json")
         sampler = ProcessSampler(app_pid)
         sampler.start()
-        receipt["provenance"]["initial_window"] = wait_for_visible_window(driver, process)
+        receipt["provenance"]["initial_window"] = wait_for_interactive_window(driver, process)
         if journey["record"]["video"] == "window":
             video = run_dir / "video.mp4"
             driver.request("record_start", path=str(video))
