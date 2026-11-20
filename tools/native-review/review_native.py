@@ -690,8 +690,20 @@ def wait_for_interactive_window(driver: Driver, process: subprocess.Popen[str],
     (a window already on the main display is left alone).
     """
     status = wait_for_visible_window(driver, process, timeout_seconds)
-    placement = driver.request("place_window")
     deadline = time.monotonic() + timeout_seconds
+    while True:
+        # The accessibility window can lag the compositor's by a moment.
+        try:
+            placement = driver.request("place_window")
+            break
+        except HarnessError as error:
+            if "no accessibility window" not in str(error):
+                raise
+            if process.poll() is not None:
+                raise HarnessError("Tauri exited while waiting for its accessibility window") from error
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
     while not driver.request("web_ready").get("ready"):
         if process.poll() is not None:
             raise HarnessError("Tauri exited while waiting for web content accessibility")

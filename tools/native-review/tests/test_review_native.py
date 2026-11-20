@@ -647,6 +647,37 @@ class JourneyTests(unittest.TestCase):
         self.assertTrue(status["moved"])
         self.assertEqual(status["bounds"]["x"], 40)
 
+    def test_interactive_window_waits_for_the_accessibility_window_to_exist(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            review_native.HarnessError("no accessibility window to place"),
+            review_native.HarnessError("no accessibility window to place"),
+            {"ok": True, "moved": False},
+            {"ok": True, "ready": True},
+            {"ok": True, "visible": True, "window_id": 7, "bounds": {"x": 40, "y": 60}},
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            status = review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+        self.assertEqual([call.args[0] for call in driver.request.call_args_list],
+                         ["window_status", "place_window", "place_window", "place_window",
+                          "web_ready", "window_status"])
+        self.assertFalse(status["moved"])
+
+    def test_interactive_window_does_not_hide_other_placement_errors(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            review_native.HarnessError("Accessibility permission is not granted"),
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            with self.assertRaisesRegex(review_native.HarnessError, "Accessibility permission"):
+                review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+
     def test_interactive_window_reports_missing_web_accessibility(self):
         driver = mock.Mock()
         process = mock.Mock()
