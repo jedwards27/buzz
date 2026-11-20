@@ -6,11 +6,13 @@ class _HuddleCallParticipants extends StatelessWidget {
     required this.error,
     required this.profiles,
     required this.fallbackLabels,
+    required this.contextualLabels,
     required this.remotePubkeys,
     required this.localPubkey,
     required this.activeSpeakerPubkeys,
     required this.speakerLevels,
     required this.workingAgentPubkeys,
+    required this.agentPubkeys,
     required this.retryTooltip,
     required this.retryIcon,
     required this.onRetry,
@@ -22,11 +24,17 @@ class _HuddleCallParticipants extends StatelessWidget {
   final String? error;
   final Map<String, UserProfile> profiles;
   final Map<String, String> fallbackLabels;
+
+  /// Huddle-scoped identity labels, keyed by lowercase pubkey.
+  final Map<String, String> contextualLabels;
   final List<String> remotePubkeys;
   final String? localPubkey;
   final Set<String> activeSpeakerPubkeys;
   final Map<String, double> speakerLevels;
   final Set<String> workingAgentPubkeys;
+
+  /// Lowercase pubkeys that the Huddle roster counts as agents.
+  final Set<String> agentPubkeys;
   final String retryTooltip;
   final IconData retryIcon;
   final VoidCallback onRetry;
@@ -43,7 +51,7 @@ class _HuddleCallParticipants extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
-                LucideIcons.triangleAlert,
+                BuzzIcons.triangleAlert,
                 size: 32,
                 color: context.colors.error,
               ),
@@ -146,9 +154,11 @@ class _HuddleCallParticipants extends StatelessWidget {
                 pubkeys: remotePubkeys,
                 profiles: profiles,
                 fallbackLabels: fallbackLabels,
+                contextualLabels: contextualLabels,
                 activeSpeakerPubkeys: activeSpeakerPubkeys,
                 speakerLevels: speakerLevels,
                 workingAgentPubkeys: workingAgentPubkeys,
+                agentPubkeys: agentPubkeys,
                 movementDuration: movementDuration,
                 entryDuration: entryDuration,
                 exitDuration: exitDuration,

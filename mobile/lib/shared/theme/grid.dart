@@ -1,4 +1,13 @@
 class Grid {
+  /// Space beneath the header actions reserved for row accessories.
+  static const double inventoryAccessoryWidth = 92;
+
+  /// Gap from inventory icons to labels.
+  static const double inventoryLabelGap = 10.0;
+
+  /// Vertical inset for a 44-point inventory row with a 22-point label.
+  static const double inventoryRowInset = 11.0;
+
   /// Quarter spacing - 2 pixels
   static const double quarter = 2.0;
 

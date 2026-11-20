@@ -12,27 +12,27 @@ class _FormattingToolbar extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         _FormatButton(
-          icon: LucideIcons.bold,
+          icon: BuzzIcons.bold,
           tooltip: 'Bold',
           onTap: () => onFormat('**'),
         ),
         _FormatButton(
-          icon: LucideIcons.italic,
+          icon: BuzzIcons.italic,
           tooltip: 'Italic',
           onTap: () => onFormat('_'),
         ),
         _FormatButton(
-          icon: LucideIcons.strikethrough,
+          icon: BuzzIcons.strikethrough,
           tooltip: 'Strikethrough',
           onTap: () => onFormat('~~'),
         ),
         _FormatButton(
-          icon: LucideIcons.code,
+          icon: BuzzIcons.code,
           tooltip: 'Code',
           onTap: () => onFormat('`'),
         ),
         _FormatButton(
-          icon: LucideIcons.squareCode,
+          icon: BuzzIcons.squareCode,
           tooltip: 'Code block',
           onTap: () => onFormat('```\n', '\n```'),
         ),
@@ -87,4 +87,38 @@ class _ComposeAction extends StatelessWidget {
       ),
     );
   }
+}
+
+// Wrap (or insert) markdown formatting around the current selection.
+void _applyComposerFormat(
+  _MarkdownEditingController controller,
+  FocusNode focusNode,
+  ObjectRef<bool> isModifyingText,
+  String prefix, [
+  String? suffix,
+]) {
+  suffix ??= prefix;
+  final text = controller.text;
+  final sel = controller.selection;
+  if (!sel.isValid) return;
+
+  isModifyingText.value = true;
+  try {
+    // The selected text is kept between the delimiters, so a chip in it
+    // keeps its recipient; an empty selection gets the caret between them.
+    final selected = text.substring(sel.start, sel.end);
+    _replaceComposerRange(
+      controller,
+      start: sel.start,
+      end: sel.end,
+      replacement: '$prefix$selected$suffix',
+      caret: sel.isCollapsed
+          ? sel.start + prefix.length
+          : sel.start + prefix.length + selected.length + suffix.length,
+      keptShift: prefix.length,
+    );
+  } finally {
+    isModifyingText.value = false;
+  }
+  focusNode.requestFocus();
 }

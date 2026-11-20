@@ -1,17 +1,77 @@
 part of '../compose_bar.dart';
 
-class _ComposerDockFrame extends StatelessWidget {
+/// Height of the conversation fade behind the composer with the keyboard up.
+const _keyboardUpBackdropHeight = 100.0;
+
+class _ComposerDockFrame extends HookWidget {
   final Animation<double> expansionAnimation;
+  final bool forceFullWidth;
   final Widget child;
 
   const _ComposerDockFrame({
     required this.expansionAnimation,
+    required this.forceFullWidth,
     required this.child,
   });
 
   @override
   Widget build(BuildContext context) {
-    final backdropHeight = mobileTabFooterBackdropHeight(context);
+    final reducedMotion = MediaQuery.disableAnimationsOf(context);
+    final recordingTransition = useAnimationController(
+      duration: reducedMotion
+          ? Duration.zero
+          : const Duration(milliseconds: 200),
+      reverseDuration: reducedMotion
+          ? Duration.zero
+          : const Duration(milliseconds: 140),
+      initialValue: forceFullWidth ? 1 : 0,
+    );
+    useEffect(() {
+      if (forceFullWidth) {
+        recordingTransition.value = math.max(
+          recordingTransition.value,
+          expansionAnimation.value.clamp(0.0, 1.0),
+        );
+        recordingTransition.forward();
+      } else {
+        recordingTransition.reverse();
+      }
+      return null;
+    }, [forceFullWidth, reducedMotion]);
+    const compactVerticalOffset = Grid.twelve + Grid.quarter;
+    final visibleBottomGutter = math.max(
+      Grid.twelve,
+      MediaQuery.viewPaddingOf(context).bottom +
+          Grid.xxs -
+          compactVerticalOffset,
+    );
+    final recordingGutterDelta = visibleBottomGutter - Grid.twelve;
+    final appView = View.of(context);
+    final restingBackdropHeight = mobileTabFooterBackdropHeight(context);
+    // The fade gives up one point per point of keyboard travel until it
+    // reaches its keyboard-up height, so it is continuous while the keyboard
+    // opens, closes or changes height. Clamping here also means the dock only
+    // rebuilds while the fade is actually changing.
+    final fadeTravel = restingBackdropHeight - _keyboardUpBackdropHeight;
+    double fadeInset(double physicalInset) =>
+        math.min(physicalInset / appView.devicePixelRatio, fadeTravel);
+    final keyboardFadeInset = useState(fadeInset(appView.viewInsets.bottom));
+    useEffect(() {
+      final observer = _ComposerKeyboardMetricsObserver(
+        view: appView,
+        onKeyboardShown: () {},
+        onKeyboardHidden: () {},
+        // View insets are physical pixels; the fade is logical.
+        onKeyboardInsetChanged: (inset) =>
+            keyboardFadeInset.value = fadeInset(inset),
+      );
+      WidgetsBinding.instance.addObserver(observer);
+      return () {
+        WidgetsBinding.instance.removeObserver(observer);
+        observer.dispose();
+      };
+    }, [appView, fadeTravel]);
+    final backdropHeight = restingBackdropHeight - keyboardFadeInset.value;
     return Stack(
       clipBehavior: Clip.none,
       children: [
@@ -27,23 +87,49 @@ class _ComposerDockFrame extends StatelessWidget {
         ),
         Padding(
           padding: EdgeInsets.only(
-            left: Grid.twelve,
-            right: Grid.twelve,
+            left: composerHorizontalGutter,
+            right: composerHorizontalGutter,
             bottom: MediaQuery.viewPaddingOf(context).bottom + Grid.xxs,
           ),
           child: Align(
             alignment: Alignment.bottomCenter,
             child: AnimatedBuilder(
-              animation: expansionAnimation,
+              animation: Listenable.merge([
+                expansionAnimation,
+                recordingTransition,
+              ]),
               child: child,
               builder: (context, child) {
-                final progress = expansionAnimation.value
-                    .clamp(0.0, 1.0)
-                    .toDouble();
-                return FractionallySizedBox(
-                  key: const ValueKey('composer-width-transition'),
-                  widthFactor: 0.85 + 0.15 * progress,
-                  child: child,
+                final widthProgress = math.max(
+                  expansionAnimation.value.clamp(0.0, 1.0),
+                  recordingTransition.value,
+                );
+                final expansionProgress = expansionAnimation.value.clamp(
+                  0.0,
+                  1.0,
+                );
+                final compactPositionProgress = 1 - expansionProgress;
+                return Transform.translate(
+                  key: const ValueKey('composer-position-transition'),
+                  offset: Offset(
+                    0,
+                    compactVerticalOffset * compactPositionProgress,
+                  ),
+                  child: Padding(
+                    key: const ValueKey('composer-recording-outer-gutter'),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: forceFullWidth
+                          ? recordingGutterDelta * compactPositionProgress
+                          : 0,
+                    ),
+                    child: FractionallySizedBox(
+                      key: const ValueKey('composer-width-transition'),
+                      widthFactor:
+                          collapsedComposerWidthFactor +
+                          (1 - collapsedComposerWidthFactor) * widthProgress,
+                      child: child,
+                    ),
+                  ),
                 );
               },
             ),
@@ -55,6 +141,7 @@ class _ComposerDockFrame extends StatelessWidget {
 }
 
 class _ComposerOverlayPortal extends StatelessWidget {
+  final bool suppressed;
   final OverlayPortalController controller;
   final ValueListenable<_AttachmentSurface> attachmentSurface;
   final bool reducedMotion;
@@ -63,6 +150,7 @@ class _ComposerOverlayPortal extends StatelessWidget {
   final Widget child;
 
   const _ComposerOverlayPortal({
+    this.suppressed = false,
     required this.controller,
     required this.attachmentSurface,
     required this.reducedMotion,
@@ -76,6 +164,7 @@ class _ComposerOverlayPortal extends StatelessWidget {
     return OverlayPortal.overlayChildLayoutBuilder(
       controller: controller,
       overlayChildBuilder: (context, layoutInfo) {
+        if (suppressed) return const SizedBox.shrink();
         final composerOrigin = MatrixUtils.transformPoint(
           layoutInfo.childPaintTransform,
           Offset.zero,
@@ -132,10 +221,25 @@ class _ComposerOverlayPortal extends StatelessWidget {
                   left: surfaceLeft,
                   bottom: layoutInfo.overlaySize.height - overlayAnchorY,
                   width: surfaceWidth,
-                  child: ClipRect(
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: Grid.xxs),
-                      child: buildOverlayPanel(surface),
+                  child: ConstrainedBox(
+                    // The suggestions grow upward from the composer, so cap
+                    // them at the space above it. A short view, such as
+                    // landscape with the keyboard up, then keeps the top row
+                    // on screen instead of honoring a reserved height.
+                    constraints: BoxConstraints(
+                      maxHeight: surface == _AttachmentSurface.closed
+                          ? math.max(
+                              0,
+                              overlayAnchorY -
+                                  MediaQuery.paddingOf(context).top,
+                            )
+                          : double.infinity,
+                    ),
+                    child: ClipRect(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: Grid.xxs),
+                        child: buildOverlayPanel(surface),
+                      ),
                     ),
                   ),
                 ),

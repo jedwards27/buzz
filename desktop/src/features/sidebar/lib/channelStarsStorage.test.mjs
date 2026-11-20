@@ -109,6 +109,15 @@ test("parseStarPayload: version 1 with no channels key returns store with empty 
 
 // ── mergeStores ───────────────────────────────────────────────────────────────
 
+test("mergeStores: a later seconds edit wins without changing wire units", () => {
+  const seconds = { starred: false, updatedAt: 1_790_000_002 };
+  const millis = { starred: true, updatedAt: 1_790_000_001_000 };
+  const local = { version: 1, channels: { "chan-a": seconds } };
+  const remote = { version: 1, channels: { "chan-a": millis } };
+  assert.deepEqual(mergeStores(local, remote).channels["chan-a"], seconds);
+  assert.deepEqual(mergeStores(remote, local).channels["chan-a"], seconds);
+});
+
 test("mergeStores: non-overlapping channels returns union of both", () => {
   const local = {
     version: 1,
@@ -311,7 +320,7 @@ test("mergeStores: a fresh at-capacity unstar defeats an older remote star", () 
       { starred: true, updatedAt: index + 1 },
     ]),
   );
-  channels["unstarred"] = { starred: false, updatedAt: 9999 };
+  channels.unstarred = { starred: false, updatedAt: 9999 };
   const bounded = boundStarStore({ version: 1, channels });
 
   const result = mergeStores(bounded, {

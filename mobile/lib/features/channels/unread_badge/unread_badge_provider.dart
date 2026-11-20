@@ -2,7 +2,6 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../channels_provider.dart';
 import '../../../shared/read_state/read_state_provider.dart';
-import '../../../shared/read_state/read_state_format.dart';
 import 'observed_unread_event.dart';
 
 class UnreadBadgeState {
@@ -39,15 +38,11 @@ final unreadBadgeProvider = Provider<UnreadBadgeState>((ref) {
         if (!latestObservedByChannel.containsKey(channel.id)) continue;
 
         final observedEvents = observedEventsByChannel[channel.id];
-        final channelReadAt = readState.effectiveTimestamp(channel.id);
         int? readAtForObservedEvent(ObservedUnreadEvent event) =>
             observedUnreadEventReadAt(
               event,
-              channelReadAt,
-              (rootId) =>
-                  readState.effectiveTimestamp(threadContextKey(rootId)),
-              (messageId) =>
-                  readState.effectiveTimestamp(msgContextKey(messageId)),
+              channel.id,
+              readState.effectiveTimestamp,
             );
 
         final unreadCount = countUnreadObservedEvents(
@@ -72,7 +67,21 @@ final unreadBadgeProvider = Provider<UnreadBadgeState>((ref) {
             observedEvents,
             readAtForObservedEvent,
           );
-          general += badgeCount > 0 ? badgeCount : 1;
+          if (badgeCount > 0) {
+            general += badgeCount;
+          } else {
+            // Only ordinary backlog is left. Count it when its row is bold:
+            // a synced `seen:<channel>` mark quiets backlog at or before it.
+            final seenAt = readState.contexts['seen:${channel.id}'];
+            final rowShowsBacklog =
+                seenAt == null ||
+                observedEvents!.values.any((event) {
+                  if (event.createdAt <= seenAt) return false;
+                  final readAt = readAtForObservedEvent(event);
+                  return readAt == null || event.createdAt > readAt;
+                });
+            if (rowShowsBacklog) general++;
+          }
         }
       }
 

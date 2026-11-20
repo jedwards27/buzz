@@ -1,14 +1,8 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:math';
-
 import 'package:flutter/foundation.dart';
 import 'package:nostr/nostr.dart' as nostr;
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../shared/crypto/nip44.dart';
-import '../../../shared/relay/relay.dart';
-import '../../../shared/read_state/read_state_time.dart';
+import '../sidebar_flag_sync.dart';
 import 'channel_stars_storage.dart';
 
 class ChannelStarsCrypto {
@@ -28,238 +22,37 @@ class ChannelStarsCrypto {
       nip44Decrypt(_conversationKey, ciphertext);
 }
 
-class ChannelStarsManager {
-  final String pubkey;
-  final ChannelStarsStorage _storage;
-  final ChannelStarsCrypto _crypto;
-  final RelaySessionNotifier? _relaySession;
-  final SignedEventRelay? _signedEventRelay;
-  final bool _remoteEnabled;
-  final VoidCallback _onChanged;
-
-  ChannelStarStore _store;
-  ChannelStarStore? _lastPublishedStore;
-  Timer? _publishDebounce;
-  int _lastRemoteCreatedAt = 0;
-  String? _lastRemoteEventId;
-  void Function()? _unsubscribe;
-  bool _disposed = false;
-
+/// Syncs the account's channel stars.
+class ChannelStarsManager extends SidebarFlagSync<ChannelStarEntry> {
   ChannelStarsManager({
-    required this.pubkey,
-    required SharedPreferences prefs,
+    required super.pubkey,
+    required super.relayUrl,
+    required super.prefs,
     required ChannelStarsCrypto crypto,
-    required RelaySessionNotifier? relaySession,
-    required SignedEventRelay? signedEventRelay,
-    required bool remoteEnabled,
-    required VoidCallback onChanged,
-  }) : _storage = ChannelStarsStorage(prefs),
-       _crypto = crypto,
-       _relaySession = relaySession,
-       _signedEventRelay = signedEventRelay,
-       _remoteEnabled = remoteEnabled,
-       _onChanged = onChanged,
-       _store = ChannelStarsStorage(prefs).read(pubkey);
+    required super.relaySession,
+    required super.signedEventRelay,
+    required super.remoteEnabled,
+    required super.onChanged,
+    @visibleForTesting super.startupRetryBaseDelay = const Duration(seconds: 2),
+  }) : super(
+         coordinate: 'channel-stars',
+         cacheKey: channelStarsKey(pubkey, relayUrl),
+         cachedFlags: ChannelStarsStorage(
+           prefs,
+         ).read(pubkey, relayUrl).channels,
+         decode: (json, strict) =>
+             ChannelStarStore.fromJson(json, strict: strict).channels,
+         encode: (flags) => ChannelStarStore(channels: flags).toJson(),
+         entry: (enabled, timestamp) =>
+             ChannelStarEntry(starred: enabled, updatedAt: timestamp),
+         decrypt: crypto.decrypt,
+         encrypt: crypto.encrypt,
+       );
 
-  ChannelStarStore get store => _store;
+  ChannelStarStore get store => ChannelStarStore(channels: values);
 
-  Future<void> initialize() async {
-    if (_disposed) return;
+  void starChannel(String channelId) => setFlag(channelId, true);
 
-    if (!_remoteEnabled || _relaySession == null) {
-      _onChanged();
-      return;
-    }
-
-    await _fetchAndMerge();
-    await _startLiveSubscription();
-    _onChanged();
-  }
-
-  void dispose({bool flushPending = true}) {
-    if (_disposed) return;
-    _disposed = true;
-
-    final hadPending = _publishDebounce != null;
-    _publishDebounce?.cancel();
-    _publishDebounce = null;
-
-    if (flushPending && hadPending && _remoteEnabled) {
-      unawaited(_publish(allowDisposed: true));
-    }
-
-    _unsubscribe?.call();
-    _unsubscribe = null;
-  }
-
-  void starChannel(String channelId) {
-    if (_disposed) return;
-    final entry = ChannelStarEntry(
-      starred: true,
-      updatedAt: currentUnixSeconds(),
-    );
-    _store = ChannelStarStore(channels: {..._store.channels, channelId: entry});
-    _persist();
-    _onChanged();
-    markDirty();
-  }
-
-  void unstarChannel(String channelId) {
-    if (_disposed) return;
-    final entry = ChannelStarEntry(
-      starred: false,
-      updatedAt: currentUnixSeconds(),
-    );
-    _store = ChannelStarStore(channels: {..._store.channels, channelId: entry});
-    _persist();
-    _onChanged();
-    markDirty();
-  }
-
-  void markDirty() {
-    if (!_remoteEnabled || _disposed) return;
-    _publishDebounce?.cancel();
-    _publishDebounce = Timer(const Duration(seconds: 5), () {
-      _publishDebounce = null;
-      unawaited(_publish());
-    });
-  }
-
-  Future<void> _fetchAndMerge() async {
-    if (_relaySession == null) return;
-    try {
-      final events = await _relaySession.fetchHistory(
-        NostrFilter(
-          kinds: const [EventKind.readState],
-          authors: [pubkey],
-          tags: const {
-            '#d': ['channel-stars'],
-          },
-          limit: 1,
-        ),
-      );
-      _mergeEvents(events);
-      _persist();
-      if (!_disposed) _onChanged();
-    } catch (_) {
-      // Local state remains usable when relay is unavailable.
-    }
-  }
-
-  Future<void> _startLiveSubscription() async {
-    if (_relaySession == null) return;
-    try {
-      _unsubscribe = await _relaySession.subscribe(
-        NostrFilter(
-          kinds: const [EventKind.readState],
-          authors: [pubkey],
-          tags: const {
-            '#d': ['channel-stars'],
-          },
-          limit: 1,
-        ),
-        _handleIncomingEvent,
-      );
-    } catch (_) {
-      // Non-fatal — local state and history still work.
-    }
-  }
-
-  void _mergeEvents(List<NostrEvent> events) {
-    for (final event in events) {
-      if (event.pubkey != pubkey) continue;
-      _mergeEvent(event);
-    }
-  }
-
-  void _mergeEvent(NostrEvent event) {
-    // Only process channel-stars d-tag events.
-    final dTag = event.getTagValue('d');
-    if (dTag != 'channel-stars') return;
-
-    try {
-      final plaintext = _crypto.decrypt(event.content);
-      final parsed = jsonDecode(plaintext);
-      if (parsed is! Map<String, dynamic>) return;
-
-      final incoming = ChannelStarStore.fromJson(parsed);
-
-      // Gate on createdAt: ignore events older than what we've already seen.
-      final isNewer =
-          event.createdAt > _lastRemoteCreatedAt ||
-          (event.createdAt == _lastRemoteCreatedAt &&
-              event.id.compareTo(_lastRemoteEventId ?? '') > 0);
-
-      if (isNewer) {
-        _lastRemoteCreatedAt = event.createdAt;
-        _lastRemoteEventId = event.id;
-        // Per-channel merge: keep the entry with the highest updatedAt for each channel.
-        _store = mergeStores(_store, incoming);
-        _persist();
-      }
-    } catch (_) {
-      // Decryption failure or parse error — keep existing state.
-    }
-  }
-
-  void _handleIncomingEvent(NostrEvent event) {
-    if (_disposed) return;
-    _mergeEvent(event);
-    if (!_disposed) _onChanged();
-  }
-
-  bool _isIdenticalToLastPublished() {
-    final last = _lastPublishedStore;
-    if (last == null) return false;
-    if (last.channels.length != _store.channels.length) return false;
-    for (final key in _store.channels.keys) {
-      final lastEntry = last.channels[key];
-      final currentEntry = _store.channels[key];
-      if (lastEntry == null ||
-          lastEntry.starred != currentEntry!.starred ||
-          lastEntry.updatedAt != currentEntry.updatedAt) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  Future<void> _publish({bool allowDisposed = false}) async {
-    if ((!allowDisposed && _disposed) ||
-        !_remoteEnabled ||
-        _signedEventRelay == null) {
-      return;
-    }
-
-    // Read-before-write: merge remote state before publishing
-    await _fetchAndMerge();
-
-    // No-op suppression: skip if nothing changed
-    if (_isIdenticalToLastPublished()) return;
-
-    try {
-      final payload = jsonEncode(_store.toJson());
-      final ciphertext = _crypto.encrypt(payload);
-      final createdAt = max(currentUnixSeconds(), _lastRemoteCreatedAt + 1);
-
-      await _signedEventRelay.submit(
-        kind: EventKind.readState,
-        content: ciphertext,
-        tags: [
-          ['d', 'channel-stars'],
-          ['t', 'channel-stars'],
-        ],
-        createdAt: createdAt,
-      );
-
-      _lastRemoteCreatedAt = max(_lastRemoteCreatedAt, createdAt);
-      _lastPublishedStore = ChannelStarStore(channels: Map.of(_store.channels));
-    } catch (error) {
-      debugPrint('[ChannelStarsManager] publish failed: $error');
-    }
-  }
-
-  void _persist() {
-    _storage.write(pubkey, _store);
-  }
+  void unstarChannel(String channelId) =>
+      setFlag(channelId, false, skipAbsentClear: true);
 }
