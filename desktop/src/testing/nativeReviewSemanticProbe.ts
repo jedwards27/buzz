@@ -35,6 +35,26 @@ function accessibleName(element: HTMLElement): string | undefined {
   );
 }
 
+type Frame = SemanticNode["frame"];
+
+/**
+ * The part of `frame` inside the viewport, or undefined when none of it is
+ * visible. The harness rejects a whole snapshot if any node leaves the
+ * viewport, so a visually hidden 1px element at -1px, or a list that overflows
+ * the window, must be clipped or skipped here rather than poison every update.
+ */
+export function clipFrameToViewport(
+  frame: Frame,
+  viewport: { width: number; height: number },
+): Frame | undefined {
+  const left = Math.max(frame.x, 0);
+  const top = Math.max(frame.y, 0);
+  const right = Math.min(frame.x + frame.width, viewport.width);
+  const bottom = Math.min(frame.y + frame.height, viewport.height);
+  if (right <= left || bottom <= top) return undefined;
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
 function snapshot(): SemanticNode[] {
   const nodes: SemanticNode[] = [];
   for (const candidate of document.querySelectorAll<HTMLElement>(
@@ -62,6 +82,12 @@ function snapshot(): SemanticNode[] {
           ? candidate.innerText.replace(/\r\n?/g, "\n").replace(/\n$/, "")
           : undefined;
     if (!id && !role && !name) continue;
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const frame = clipFrameToViewport(
+      { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      viewport,
+    );
+    if (!frame) continue;
     nodes.push({
       ...(id ? { id } : {}),
       ...(role ? { role } : {}),
@@ -72,16 +98,8 @@ function snapshot(): SemanticNode[] {
         !candidate.hasAttribute("disabled") &&
         candidate.getAttribute("aria-disabled") !== "true",
       focused: candidate === document.activeElement,
-      frame: {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-      },
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight,
-      },
+      frame,
+      viewport,
     });
   }
   return nodes;
