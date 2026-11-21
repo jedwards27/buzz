@@ -613,6 +613,18 @@ func postText(_ text: String, pid: pid_t) throws {
 /// the driver's own ancestry (macOS names the responsible process, such as the
 /// agent that launched the run, or an interpreter), the reviewed app, and any
 /// `extra` names the caller launched on purpose (a trigger child).
+/// The process macOS holds responsible for `pid`: the one a privacy prompt names. It is
+/// fixed when the process is spawned, so unlike the parent chain it survives the
+/// launcher exiting (a review started detached, for example under nohup). The symbol is
+/// private to libSystem, so it is looked up at run time and its absence only narrows
+/// what counts as this review's own process.
+func responsiblePid(for pid: pid_t) -> pid_t? {
+    typealias Function = @convention(c) (pid_t) -> pid_t
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid") else { return nil }
+    let responsible = unsafeBitCast(symbol, to: Function.self)(pid)
+    return responsible > 1 && responsible != pid ? responsible : nil
+}
+
 func reviewProcessNames(target: pid_t?, extra: [String]) -> [String] {
     var names = Set(extra)
     func add(pid: pid_t) {
@@ -639,6 +651,7 @@ func reviewProcessNames(target: pid_t?, extra: [String]) -> [String] {
         pid = pid_t(info.pbi_ppid)
         hops += 1
     }
+    if let responsible = responsiblePid(for: getpid()) { add(pid: responsible) }
     if let target { add(pid: target) }
     names.remove("")
     return Array(names)

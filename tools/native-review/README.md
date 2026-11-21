@@ -111,8 +111,10 @@ hold: the window belongs to the macOS system prompt agent (bundle id
 `com.apple.UserNotificationCenter`, executable under `/System/Library/CoreServices`);
 it is a system alert (`AXWindow`/`AXSystemDialog`, not a sheet or a document
 window); its text parses as a microphone, camera or Local Network prompt; the app
-it names is one of this run's own processes (the driver's ancestry, the app under
-review, or a trigger child passed with `--expect`); and exactly one button carries
+it names is one of this run's own processes (the driver's ancestry, the process
+macOS holds responsible for the driver, which is what a prompt names and which
+survives a detached launch, the app under review, or a trigger child passed with
+`--expect`); and exactly one button carries
 the expected title. It declines microphone and camera access (a review never needs
 them) and allows Local Network. A prompt from any other app, a sheet, or an alert
 from another process is never touched.
