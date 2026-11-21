@@ -68,7 +68,7 @@ import Testing
 
 // The real prompt, as the VM's accessibility tree shows it.
 private func systemPrompt(
-    text: String = "\u{201C}bloxlet\u{201D} would like to access the Microphone.",
+    text: String = "\u{201C}LauncherHost\u{201D} would like to access the Microphone.",
     buttons: [String] = ["Help", "Don\u{2019}t Allow", "Allow"],
     bundleID: String? = "com.apple.UserNotificationCenter",
     executable: String? = "/System/Library/CoreServices/UserNotificationCenter.app/Contents/MacOS/UserNotificationCenter",
@@ -80,8 +80,8 @@ private func systemPrompt(
 }
 
 @Test func promptTextNamesTheKindAndTheApp() {
-    #expect(parsePrivacyPrompt(texts: ["\u{201C}bloxlet\u{201D} would like to access the Microphone."])
-        == PrivacyPrompt(kind: .microphone, appName: "bloxlet"))
+    #expect(parsePrivacyPrompt(texts: ["\u{201C}LauncherHost\u{201D} would like to access the Microphone."])
+        == PrivacyPrompt(kind: .microphone, appName: "LauncherHost"))
     #expect(parsePrivacyPrompt(texts: ["\"Terminal\" would like to access the Camera."])
         == PrivacyPrompt(kind: .camera, appName: "Terminal"))
     #expect(parsePrivacyPrompt(texts: ["Allow \u{201C}Python\u{201D} to find devices on local networks?", "This will allow the app to discover"])
@@ -91,7 +91,7 @@ private func systemPrompt(
 }
 
 @Test func theRealMicrophonePromptIsDeclinedWhenItNamesAProcessOfTheReview() {
-    #expect(decidePrivacyPrompt(systemPrompt(), expectedApps: ["bloxlet", "Buzz Native Review"]) == .press("Don't Allow"))
+    #expect(decidePrivacyPrompt(systemPrompt(), expectedApps: ["LauncherHost", "Buzz Native Review"]) == .press("Don't Allow"))
 }
 
 @Test func theRealLocalNetworkPromptIsAllowedWhenItNamesAProcessOfTheReview() {
@@ -102,7 +102,7 @@ private func systemPrompt(
 
 @Test func aPromptNamingAnotherAppIsNeverAnswered() {
     guard case .skip(let reason) = decidePrivacyPrompt(systemPrompt(text: "\u{201C}Zoom\u{201D} would like to access the Microphone."),
-                                                       expectedApps: ["bloxlet", "Buzz Native Review"]) else {
+                                                       expectedApps: ["LauncherHost", "Buzz Native Review"]) else {
         Issue.record("answered a prompt for another app"); return
     }
     #expect(reason.contains("Zoom"))
@@ -117,7 +117,7 @@ private func systemPrompt(
         systemPrompt(executable: nil),
         systemPrompt(executable: "/System/Library/CoreServices/../../../tmp/evil"),
     ] {
-        guard case .skip = decidePrivacyPrompt(impostor, expectedApps: ["bloxlet"]) else {
+        guard case .skip = decidePrivacyPrompt(impostor, expectedApps: ["LauncherHost"]) else {
             Issue.record("answered a window the system prompt agent does not own: \(impostor)"); continue
         }
     }
@@ -125,17 +125,17 @@ private func systemPrompt(
 
 @Test func aWindowThatIsNotASystemAlertIsNeverAnswered() {
     for other in [systemPrompt(role: "AXSheet"), systemPrompt(subrole: "AXStandardWindow"), systemPrompt(subrole: nil), systemPrompt(role: nil)] {
-        guard case .skip = decidePrivacyPrompt(other, expectedApps: ["bloxlet"]) else {
+        guard case .skip = decidePrivacyPrompt(other, expectedApps: ["LauncherHost"]) else {
             Issue.record("answered a window that is not a system dialog: \(other)"); continue
         }
     }
 }
 
 @Test func aPromptWithoutTheExpectedButtonOrWithDuplicatesIsNotAnswered() {
-    guard case .skip = decidePrivacyPrompt(systemPrompt(buttons: ["Help", "Allow"]), expectedApps: ["bloxlet"]) else {
+    guard case .skip = decidePrivacyPrompt(systemPrompt(buttons: ["Help", "Allow"]), expectedApps: ["LauncherHost"]) else {
         Issue.record("pressed a missing button"); return
     }
-    guard case .skip = decidePrivacyPrompt(systemPrompt(buttons: ["Don\u{2019}t Allow", "Don't Allow"]), expectedApps: ["bloxlet"]) else {
+    guard case .skip = decidePrivacyPrompt(systemPrompt(buttons: ["Don\u{2019}t Allow", "Don't Allow"]), expectedApps: ["LauncherHost"]) else {
         Issue.record("pressed an ambiguous button"); return
     }
 }
