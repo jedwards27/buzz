@@ -22,29 +22,44 @@ if [[ ! -x "$DRIVER" ]]; then
   swift build -c release --package-path "$SCRIPT_DIR/swift" >/dev/null
 fi
 
+# Stop a trigger child. A process blocked on an unanswered privacy prompt can ignore
+# SIGTERM, so escalate rather than wait on it forever.
+stop_trigger() {
+  kill "$1" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6; do kill -0 "$1" 2>/dev/null || break; sleep 0.5; done
+  kill -9 "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
 # answer LABEL TRIGGER_NAME COMMAND...
+# Starts the trigger, then answers whatever prompt the driver can positively identify
+# as this run's own. The log line carries the prompt text that was actually answered,
+# which may be an earlier trigger's prompt that was still on screen.
 answer() {
   local label="$1" trigger_name="$2"
   shift 2
   "$@" >/dev/null 2>&1 &
   local trigger=$!
-  local pressed=0 skipped=""
+  local pressed=0 skipped="" failed=""
   for _ in $(seq 1 20); do
-    reply="$("$DRIVER" answer-privacy-prompt --expect "$trigger_name")"
-    if grep -Eq '"answered" ?: ?true' <<<"$reply"; then
+    if ! reply="$("$DRIVER" answer-privacy-prompt --expect "$trigger_name" 2>&1)"; then
+      failed="$reply"
+    elif grep -Eq '"answered" ?: ?true' <<<"$reply"; then
       pressed=1
-      echo "[answer-first-run-prompts] $label: $reply"
+      echo "[answer-first-run-prompts] while triggering $label, answered: $reply"
       break
+    elif grep -Eq '"skipped" ?: ?\[ ?"' <<<"$reply"; then
+      skipped="$reply"
     fi
-    grep -Eq '"skipped" ?: ?\[ ?"' <<<"$reply" && skipped="$reply"
     sleep 0.5
   done
-  kill "$trigger" 2>/dev/null || true
-  wait "$trigger" 2>/dev/null || true
+  stop_trigger "$trigger"
   if ((pressed)); then
     :
   elif [[ -n "$skipped" ]]; then
     echo "[answer-first-run-prompts] $label: a window was left alone because it could not be identified as this run's prompt: $skipped"
+  elif [[ -n "$failed" ]]; then
+    echo "[answer-first-run-prompts] $label: the driver could not run: $failed"
   else
     echo "[answer-first-run-prompts] $label: no prompt appeared (already answered, or not needed)"
   fi
