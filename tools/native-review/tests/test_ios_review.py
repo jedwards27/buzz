@@ -102,6 +102,13 @@ class IosReviewTests(unittest.TestCase):
         for name in sentinels:
             self.assertNotIn(name, environment)
 
+    def test_flutter_environment_keeps_pub_mirror_but_not_credentials(self):
+        host = {"PUB_HOSTED_URL": "https://pub.example.org/api", "PUB_TOKEN": "secret"}
+        with mock.patch.dict(ios_review.os.environ, host, clear=False):
+            environment = ios_review.flutter_environment()
+        self.assertEqual(environment["PUB_HOSTED_URL"], "https://pub.example.org/api")
+        self.assertNotIn("PUB_TOKEN", environment)
+
     def test_flutter_environment_carries_private_proceed_url(self):
         environment = ios_review.flutter_environment("http://127.0.0.1:1/proceed/token")
         self.assertEqual(environment["BUZZ_NATIVE_REVIEW_PROCEED_URL"], "http://127.0.0.1:1/proceed/token")

@@ -5,6 +5,8 @@ import pathlib
 import re
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "review_native.py"
@@ -502,7 +504,7 @@ class JourneyTests(unittest.TestCase):
                  mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
                  mock.patch.object(review_native, "Driver", return_value=driver), \
                  mock.patch.object(review_native, "ProcessSampler", return_value=sampler), \
-                 mock.patch.object(review_native, "wait_for_visible_window", return_value={"visible": True}), \
+                 mock.patch.object(review_native, "wait_for_interactive_window", return_value={"visible": True}), \
                  mock.patch.object(review_native, "capture_step", return_value={}), \
                  mock.patch.object(review_native, "terminate_and_reap", return_value=[]) as reap, \
                  mock.patch.object(review_native, "cleanup_review_state") as cleanup:
@@ -549,7 +551,7 @@ class JourneyTests(unittest.TestCase):
                  mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
                  mock.patch.object(review_native, "Driver", return_value=driver), \
                  mock.patch.object(review_native, "ProcessSampler", return_value=sampler), \
-                 mock.patch.object(review_native, "wait_for_visible_window", return_value={"visible": True}), \
+                 mock.patch.object(review_native, "wait_for_interactive_window", return_value={"visible": True}), \
                  mock.patch.object(review_native, "wait_expectation"), \
                  mock.patch.object(review_native, "capture_step", return_value={}), \
                  mock.patch.object(review_native, "terminate_and_reap", return_value=[]) as reap, \
@@ -614,6 +616,217 @@ class JourneyTests(unittest.TestCase):
         with self.assertRaisesRegex(review_native.HarnessError, "exited"):
             review_native.wait_for_visible_window(driver, process, timeout_seconds=1)
         driver.request.assert_not_called()
+
+    def test_host_toolchain_overrides_reach_builds_but_not_the_reviewed_app(self):
+        overrides = {"SHERPA_ONNX_ARCHIVE_DIR": "/opt/archives", "SHERPA_ONNX_LIB_DIR": "/opt/sherpa/lib"}
+        with mock.patch.dict(review_native.os.environ, overrides, clear=False):
+            build = review_native.scrubbed_environment(include_home=True)
+            app = review_native.scrubbed_environment()
+        for name, value in overrides.items():
+            self.assertEqual(build[name], value)
+            self.assertNotIn(name, app)
+
+    def test_secret_shaped_toolchain_names_are_still_dropped(self):
+        with mock.patch.dict(review_native.os.environ, {"SHERPA_ONNX_ARCHIVE_TOKEN": "x"}, clear=False):
+            self.assertNotIn("SHERPA_ONNX_ARCHIVE_TOKEN",
+                             review_native.scrubbed_environment(include_home=True))
+
+    def test_interactive_window_is_placed_then_waits_for_web_accessibility(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
+            {"ok": True, "moved": True, "verified": True, "window_id": 7,
+             "before": {"x": -1016, "y": 36, "width": 1008, "height": 726},
+             "after": {"x": 40, "y": 60, "width": 1008, "height": 726}},
+            {"ok": True, "answered": False},
+            {"ok": True, "ready": False},
+            {"ok": True, "answered": True},
+            {"ok": True, "ready": True},
+            {"ok": True, "visible": True, "window_id": 7, "bounds": {"x": 40, "y": 60}},
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            status = review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+        self.assertEqual([call.args[0] for call in driver.request.call_args_list],
+                         ["window_status", "answer_privacy_prompt", "place_window",
+                          "answer_privacy_prompt", "web_ready",
+                          "answer_privacy_prompt", "web_ready", "window_status"])
+        self.assertTrue(status["moved"])
+        self.assertEqual(status["bounds"]["x"], 40)
+        # The receipt records what was moved and where it ended up.
+        self.assertTrue(status["placement"]["verified"])
+        self.assertEqual(status["placement"]["before"]["x"], -1016)
+        self.assertEqual(status["placement"]["after"]["x"], 40)
+
+    def test_interactive_window_fails_when_placement_is_not_verified(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
+            {"ok": True, "moved": True, "verified": False,
+             "before": {"x": -1016, "y": 36, "width": 1008, "height": 726},
+             "after": {"x": -1016, "y": 36, "width": 1008, "height": 726}},
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            with self.assertRaisesRegex(review_native.HarnessError, "not verified"):
+                review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+
+    def test_interactive_window_waits_for_the_accessibility_window_to_exist(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
+            review_native.HarnessError("no accessibility window to place"),
+            {"ok": True, "answered": False},
+            review_native.HarnessError("no accessibility window to place"),
+            {"ok": True, "answered": False},
+            {"ok": True, "moved": False},
+            {"ok": True, "answered": False},
+            {"ok": True, "ready": True},
+            {"ok": True, "visible": True, "window_id": 7, "bounds": {"x": 40, "y": 60}},
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            status = review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+        self.assertEqual([call.args[0] for call in driver.request.call_args_list],
+                         ["window_status", "answer_privacy_prompt", "place_window",
+                          "answer_privacy_prompt", "place_window", "answer_privacy_prompt",
+                          "place_window", "answer_privacy_prompt", "web_ready", "window_status"])
+        self.assertFalse(status["moved"])
+
+    def test_interactive_window_does_not_hide_other_placement_errors(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+        driver.request.side_effect = [
+            {"ok": True, "visible": True, "window_id": 7},
+            {"ok": True, "answered": False},
+            review_native.HarnessError("Accessibility permission is not granted"),
+        ]
+        with mock.patch.object(review_native.time, "sleep"):
+            with self.assertRaisesRegex(review_native.HarnessError, "Accessibility permission"):
+                review_native.wait_for_interactive_window(driver, process, timeout_seconds=5)
+
+    def test_interactive_window_reports_missing_web_accessibility(self):
+        driver = mock.Mock()
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def respond(command, **_):
+            return {"ok": True, "visible": True, "ready": False, "moved": False}
+
+        driver.request.side_effect = respond
+        with mock.patch.object(review_native.time, "sleep"):
+            with self.assertRaisesRegex(review_native.HarnessError, "web content accessibility"):
+                review_native.wait_for_interactive_window(driver, process, timeout_seconds=0.05)
+
+    def test_journey_runs_after_the_window_is_interactive(self):
+        journey = {
+            "flow": "interactive_order",
+            "record": {"video": "off", "screenshots": False, "accessibility": False},
+            "steps": [{"name": "wait", "act": {"type": "wait", "duration_ms": 0},
+                       "expect": {"focused": False}}],
+            "cleanup": {"terminate_app": True, "remove_state": True},
+        }
+        events = []
+        process = mock.Mock(pid=42)
+        driver = mock.Mock()
+        driver.request.side_effect = lambda command, **_: events.append(command) or {"ok": True}
+        sampler = mock.Mock()
+        sampler.finish.return_value = {"sample_count": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = pathlib.Path(directory) / "output"
+            fixture = {"secret_path": str(pathlib.Path(directory) / "identity.key")}
+            app_binary = pathlib.Path(directory) / "buzz-desktop"
+            app_binary.write_bytes(b"binary")
+            journey_path = pathlib.Path(directory) / "journey.yaml"
+            journey_path.write_text("fixture")
+            with mock.patch.object(review_native, "load_journey", return_value=journey), \
+                 mock.patch.object(review_native, "provenance", return_value={"head_sha": "a" * 40}), \
+                 mock.patch.object(review_native, "machine_fingerprint", return_value={}), \
+                 mock.patch.object(review_native, "doctor", return_value={"ok": True}), \
+                 mock.patch.object(review_native, "prepare_fixture", return_value=fixture), \
+                 mock.patch.object(review_native, "semantic_probe_server", return_value=(mock.Mock(), "probe")), \
+                 mock.patch.object(review_native, "build_and_launch", return_value=(process, app_binary, 42)), \
+                 mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
+                 mock.patch.object(review_native, "Driver", return_value=driver), \
+                 mock.patch.object(review_native, "ProcessSampler", return_value=sampler), \
+                 mock.patch.object(review_native, "wait_for_interactive_window",
+                                   side_effect=lambda *a, **k: events.append("interactive") or {"visible": True}), \
+                 mock.patch.object(review_native, "wait_expectation"), \
+                 mock.patch.object(review_native, "capture_step", return_value={}), \
+                 mock.patch.object(review_native, "terminate_and_reap", return_value=[]), \
+                 mock.patch.object(review_native, "cleanup_review_state"):
+                review_native.run_journey(journey_path, "ws://127.0.0.1:3030", output_root)
+        self.assertEqual(events[0], "interactive")
+        self.assertLess(events.index("interactive"), events.index("act"))
+
+    def test_doctor_requires_ffmpeg_for_shareable_evidence(self):
+        with mock.patch.object(review_native.shutil, "which",
+                               side_effect=lambda name: None if name == "ffmpeg" else f"/usr/bin/{name}"), \
+             mock.patch.object(review_native, "build_driver", return_value=pathlib.Path("driver")), \
+             mock.patch.object(review_native, "run",
+                               return_value=mock.Mock(stdout='{"checks": []}', stderr="")), \
+             mock.patch("builtins.print"):
+            result = review_native.doctor()
+        self.assertFalse(result["ok"])
+        self.assertIn("ffmpeg", [c["name"] for c in result["checks"] if not c["ok"]])
+
+
+class SemanticProbeServerTests(unittest.TestCase):
+    NODE = {"id": "message-composer", "role": "textbox", "name": "Message", "value": "",
+            "scrollY": 0, "enabled": True, "focused": False,
+            "frame": {"x": 1, "y": 2, "width": 3, "height": 4},
+            "viewport": {"width": 100, "height": 100}}
+
+    def post(self, url, body=None, headers=None):
+        # navigator.sendBeacon sends a plain POST and cannot add request headers.
+        request = urllib.request.Request(
+            url, data=json.dumps(body if body is not None else [self.NODE]).encode(),
+            headers={"Content-Type": "text/plain;charset=UTF-8", **(headers or {})}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            error.close()
+            return error.code
+
+    def serve(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "semantic.json"
+        server, url = review_native.semantic_probe_server(path, "s3cret-token")
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return path, url
+
+    def test_probe_url_carries_the_token_so_a_beacon_is_accepted(self):
+        path, url = self.serve()
+        self.assertIn("token=s3cret-token", url)
+        self.assertEqual(self.post(url), 204)
+        self.assertEqual(json.loads(path.read_text())[0]["id"], "message-composer")
+
+    def test_beacon_without_or_with_the_wrong_token_is_rejected(self):
+        path, url = self.serve()
+        base = url.split("?")[0]
+        self.assertEqual(self.post(base), 401)
+        self.assertEqual(self.post(base + "?token=nope"), 401)
+        self.assertFalse(path.exists())
+
+    def test_header_token_is_still_accepted(self):
+        path, url = self.serve()
+        base = url.split("?")[0]
+        self.assertEqual(self.post(base, headers={"X-Buzz-Native-Review-Token": "s3cret-token"}), 204)
+        self.assertTrue(path.exists())
+
+    def test_unknown_path_is_not_found(self):
+        _, url = self.serve()
+        self.assertEqual(self.post(url.replace("/snapshot", "/other")), 404)
 
 
 class PerformanceTests(unittest.TestCase):

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Exit 0 only when the Postgres on the harness port is demonstrably the one that
+# setup-macos-vm created, so a schema reset can never land on a database that
+# belongs to someone else. Checks, all of which must hold:
+#   * the server's data_directory is the state dir's own postgres directory;
+#   * the state dir carries the harness marker file;
+#   * the database carries the harness marker as its comment.
+# Fails closed: if any of it cannot be read (wrong password, no server), it
+# refuses. Used by setup-macos-vm and scripts/start-isolated-test-relay.sh.
+#
+#   check-harness-database --state-dir DIR [--port 5471] [--db buzz] [--user buzz]
+# PSQL overrides the psql binary; PGPASSWORD defaults to the public dev constant.
+set -euo pipefail
+
+MARKER="buzz-native-review-harness"
+MARKER_FILE=".buzz-native-review-harness"
+STATE_DIR="" PORT=5471 DB=buzz USER_NAME=buzz
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --state-dir) STATE_DIR="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --db) DB="$2"; shift 2 ;;
+    --user) USER_NAME="$2"; shift 2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+refuse() { printf '[check-harness-database] REFUSING: %s\n' "$*" >&2; exit 1; }
+[[ -n "$STATE_DIR" ]] || refuse "no --state-dir given"
+[[ -d "$STATE_DIR/postgres" ]] || refuse "$STATE_DIR/postgres does not exist"
+[[ -f "$STATE_DIR/$MARKER_FILE" ]] || refuse "$STATE_DIR is not a harness state dir (no $MARKER_FILE)"
+
+PSQL="${PSQL:-psql}"
+export PGPASSWORD="${PGPASSWORD:-buzz_dev}"
+query() { "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER_NAME" -d postgres -qtAc "$1" 2>/dev/null; }
+
+data_dir="$(query 'SHOW data_directory')" || refuse "cannot read data_directory from the server on :$PORT"
+[[ -n "$data_dir" && -d "$data_dir" ]] || refuse "server on :$PORT reports an unreadable data directory"
+actual="$(cd "$data_dir" && pwd -P)"
+expected="$(cd "$STATE_DIR/postgres" && pwd -P)"
+[[ "$actual" == "$expected" ]] || refuse "server on :$PORT runs from $actual, not the harness data dir $expected"
+
+comment="$(query "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = '$DB'")" \
+  || refuse "cannot read database $DB"
+[[ "$comment" == "$MARKER" ]] || refuse "database $DB on :$PORT is not marked as the harness database"
+echo "[check-harness-database] :$PORT database $DB is the harness database ($expected)"

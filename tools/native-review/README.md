@@ -65,6 +65,68 @@ or VM for untrusted changes.
    xcrun simctl list devices available
    ```
 
+### Headless macOS VM without Docker
+
+A cloud or CI Mac usually has a GUI session (Accessibility and Screen Recording
+work) but no Docker, so `scripts/start-isolated-test-relay.sh` cannot start its
+Compose stack. `tools/native-review/bin/setup-macos-vm` is the idempotent
+one-shot for that machine:
+
+```bash
+tools/native-review/bin/setup-macos-vm            # services, relay, prefetch, prompt
+. ~/.buzz-native-review/env.sh                      # PATH + SHERPA_ONNX_ARCHIVE_DIR
+just native-review-desktop tools/native-review/desktop/composer-keyboard.yaml
+```
+
+It installs `postgresql@17`, `redis`, `ffmpeg` and `tmux` with Homebrew; builds a
+pinned MinIO with `go install` (release binaries may be unreachable); runs
+Postgres/Redis/MinIO natively on the harness ports (5471/6471/9471) under
+`~/.buzz-native-review`; creates the `buzz-media` bucket with a SigV4 `curl`;
+starts the isolated relay with `BUZZ_HARNESS_NATIVE_SERVICES=1`; prefetches the
+`sherpa-onnx` archive (a TLS-intercepting proxy breaks that crate's rustls
+downloader with `UnknownIssuer`, so the build reads `SHERPA_ONNX_ARCHIVE_DIR`
+instead); and answers the one-time macOS "Local Network" (Allow) and "Microphone"
+(Don't Allow) prompts through the same Accessibility-trusted driver
+(`bin/answer-first-run-prompts`). Unanswered, the microphone prompt freezes the
+app's web view.
+
+What it does not do: grant Accessibility or Screen Recording (the invoking
+process needs them; `review-native doctor --require-permissions` checks), install
+Homebrew, Go or Xcode, or set up iOS (CocoaPods mirrors, simulators). If your
+network cannot reach pub.dev, export `PUB_HOSTED_URL` before running the setup
+script and `review-ios`; the iOS runner passes it through.
+
+The driver moves the review window onto the main display and waits for WebKit's
+accessibility tree before the first locator. It moves the same window the harness
+reports (matched by frame, never "the first window"), reads the frame back, fails
+the run if the window is not wholly on the main display, and records the
+before/after frames in the receipt (`provenance.initial_window.placement`). A VM
+with a second display otherwise opens the app there, where the web view exposes no
+accessibility children.
+
+If the app cannot take focus because a first-run macOS privacy prompt is up, the
+driver (`answer-privacy-prompt`) answers it, but only when it can positively
+identify the prompt, and otherwise leaves it alone and says why. All of these must
+hold: the window belongs to the macOS system prompt agent (bundle id
+`com.apple.UserNotificationCenter`, executable under `/System/Library/CoreServices`);
+it is a system alert (`AXWindow`/`AXSystemDialog`, not a sheet or a document
+window); its text parses as a microphone, camera or Local Network prompt; the app
+it names is one of this run's own processes (the driver's ancestry, the process
+macOS holds responsible for the driver, which is what a prompt names and which
+survives a detached launch, the app under review, or a trigger child passed with
+`--expect`); and exactly one button carries
+the expected title. It declines microphone and camera access (a review never needs
+them) and allows Local Network. A prompt from any other app, a sheet, or an alert
+from another process is never touched.
+
+`setup-macos-vm` refuses to run outside a virtual machine
+(`kern.hv_vmm_present` must be 1) unless `--allow-non-vm` is passed. It marks its
+state directory and database as the harness's own, uses a pidfile for each service
+it starts, and refuses to reuse a port that is open but not its own. The relay
+script refuses to run `DROP SCHEMA` in native-services mode unless
+`bin/check-harness-database` confirms the server runs from the harness data
+directory and the database carries the harness marker.
+
 ## Run existing journeys
 
 ```bash

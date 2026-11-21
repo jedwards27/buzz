@@ -22,6 +22,11 @@
 #
 # Teardown (safe — scoped to our project only):
 #   docker compose -p buzz-harness -f docker-compose.harness.yml down -v
+#
+# Hosts without Docker (e.g. a managed macOS VM): set BUZZ_HARNESS_NATIVE_SERVICES=1
+# and BUZZ_HARNESS_STATE_DIR after Postgres/Redis/MinIO were started on the ports above
+# by tools/native-review/bin/setup-macos-vm, which also creates the media bucket and
+# marks the state dir and database so the schema reset below can be checked.
 # =============================================================================
 set -euo pipefail
 
@@ -69,12 +74,21 @@ ok()  { echo -e "${GREEN}[isolated-relay]${NC} $*"; }
 err() { echo -e "${RED}[isolated-relay]${NC} $*" >&2; }
 
 # ── Backing services (scoped to buzz-harness only) ───────────────────────────
-log "Bringing up backing services (project=${PROJECT})..."
-docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" up -d
+NATIVE_SERVICES="${BUZZ_HARNESS_NATIVE_SERVICES:-0}"
+if [[ "${NATIVE_SERVICES}" == "1" ]]; then
+  log "Using natively-run backing services on :${PG_PORT}/:${REDIS_PORT}/:${MINIO_PORT} (no Docker)..."
+else
+  log "Bringing up backing services (project=${PROJECT})..."
+  docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" up -d
+fi
 
 wait_pg() {
   for _ in $(seq 1 60); do
-    if docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" exec -T postgres \
+    if [[ "${NATIVE_SERVICES}" == "1" ]]; then
+      if pg_isready -h localhost -p "${PG_PORT}" -U buzz >/dev/null 2>&1; then
+        ok "Postgres ready"; return 0
+      fi
+    elif docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" exec -T postgres \
          pg_isready -U buzz >/dev/null 2>&1; then
       ok "Postgres ready"; return 0
     fi
@@ -86,13 +100,29 @@ wait_pg
 
 # ── Schema + partitions ──────────────────────────────────────────────────────
 export PGPASSWORD=buzz_dev
-psql_h() { docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" exec -T postgres \
-  psql -U buzz -d buzz -v ON_ERROR_STOP=1 "$@"; }
+psql_h() {
+  if [[ "${NATIVE_SERVICES}" == "1" ]]; then
+    psql -h localhost -p "${PG_PORT}" -U buzz -d buzz -v ON_ERROR_STOP=1 "$@"
+  else
+    docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" exec -T postgres \
+      psql -U buzz -d buzz -v ON_ERROR_STOP=1 "$@"
+  fi
+}
 
 log "Resetting isolated database and applying schema..."
-# This database belongs only to the buzz-harness Compose project. Reset it on
-# every launch so stale partitions/events from an earlier proof cannot alter
-# schema planning or test results.
+# This database is the harness's own: the buzz-harness Compose project's, or, with
+# BUZZ_HARNESS_NATIVE_SERVICES=1, the Postgres that setup-macos-vm started. Reset it
+# on every launch so stale partitions/events from an earlier proof cannot alter
+# schema planning or test results. Natively run, the port is not ours by
+# construction, so refuse to drop anything unless the server is demonstrably the
+# harness's (its data directory, a marker file and a marker on the database).
+if [[ "${NATIVE_SERVICES}" == "1" ]]; then
+  [[ -n "${BUZZ_HARNESS_STATE_DIR:-}" ]] \
+    || { err "BUZZ_HARNESS_NATIVE_SERVICES=1 needs BUZZ_HARNESS_STATE_DIR (set by setup-macos-vm); refusing to reset a database."; exit 1; }
+  "${REPO_ROOT}/tools/native-review/bin/check-harness-database" \
+    --state-dir "${BUZZ_HARNESS_STATE_DIR}" --port "${PG_PORT}" --db buzz --user buzz \
+    || { err "Postgres on :${PG_PORT} is not the harness database; refusing to reset it."; exit 1; }
+fi
 psql_h -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 export PGSCHEMA_PLAN_HOST=localhost PGSCHEMA_PLAN_PORT=${PG_PORT}
 export PGSCHEMA_PLAN_DB=buzz PGSCHEMA_PLAN_USER=buzz PGSCHEMA_PLAN_PASSWORD=buzz_dev
@@ -141,8 +171,9 @@ if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTE
   exit 1
 fi
 log "Starting relay in tmux session '${TMUX_SESSION}' on :${RELAY_MAIN} (health :${RELAY_HEALTH}, metrics :${RELAY_METRICS})..."
+RELAY_DATABASE_URL="postgres://buzz:buzz_dev@localhost:${PG_PORT}/buzz" # sadscan:disable np.postgres.1 -- public dev fixture from docker-compose.harness.yml
 tmux new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' && env \
-  DATABASE_URL=postgres://buzz:buzz_dev@localhost:${PG_PORT}/buzz \
+  DATABASE_URL=${RELAY_DATABASE_URL} \
   REDIS_URL=redis://localhost:${REDIS_PORT} \
   RELAY_URL=ws://localhost:${RELAY_MAIN} \
   BUZZ_BIND_ADDR=0.0.0.0:${RELAY_MAIN} \
@@ -163,7 +194,11 @@ for _ in $(seq 1 30); do
     ok "Relay live — BUZZ_E2E_RELAY_URL=http://localhost:${RELAY_MAIN}"
     ok "Logs: ${RELAY_LOG}   Attach: tmux attach -t ${TMUX_SESSION}"
     ok "Stop relay: tmux kill-session -t ${TMUX_SESSION}"
-    ok "Full teardown: docker compose -p ${PROJECT} -f ${COMPOSE_FILE} down -v"
+    if [[ "${NATIVE_SERVICES}" == "1" ]]; then
+      ok "Backing services run natively under ${BUZZ_HARNESS_STATE_DIR} (stop them with pg_ctl, redis-cli shutdown and the pid in minio.pid)"
+    else
+      ok "Full teardown: docker compose -p ${PROJECT} -f ${COMPOSE_FILE} down -v"
+    fi
     exit 0
   fi
   sleep 1
