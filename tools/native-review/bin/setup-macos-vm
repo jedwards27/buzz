@@ -9,7 +9,9 @@
 #   * No ffmpeg: installs it (video-share.mp4 finalization needs it).
 #   * A TLS-intercepting proxy that sherpa-onnx-sys's build script (rustls with
 #     bundled roots) rejects with `UnknownIssuer`: prefetches the archive with
-#     curl and exports SHERPA_ONNX_ARCHIVE_DIR.
+#     curl and exports SHERPA_ONNX_ARCHIVE_DIR. The download base defaults to the
+#     project's GitHub releases; set SHERPA_ONNX_DOWNLOAD_BASE to fetch the same
+#     path layout through a caching mirror instead.
 #   * pub.dev blocked (iOS/Flutter only): when PUB_HOSTED_URL is set in the
 #     environment running this script, it is recorded in env.sh so a later
 #     review-ios run receives the mirror. No mirror URL is hard-coded here.
@@ -189,8 +191,11 @@ sherpa_version="$(awk '/^name = "sherpa-onnx-sys"$/ {getline; gsub(/[^0-9.]/, ""
 sherpa_archive="sherpa-onnx-v${sherpa_version}-osx-arm64-static-lib.tar.bz2"
 if [[ ! -s "$STATE_DIR/sherpa/$sherpa_archive" ]] || ! bzip2 -t "$STATE_DIR/sherpa/$sherpa_archive" 2>/dev/null; then
   log "downloading $sherpa_archive"
-  curl -fsSL --retry 3 -o "$STATE_DIR/sherpa/$sherpa_archive.part" \
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${sherpa_version}/${sherpa_archive}"
+  sherpa_url="${SHERPA_ONNX_DOWNLOAD_BASE:-https://github.com/k2-fsa/sherpa-onnx/releases/download}/v${sherpa_version}/${sherpa_archive}"
+  log "curl -fsSL --retry 3 $sherpa_url"
+  sherpa_status="$(curl -fsSL --retry 3 -o "$STATE_DIR/sherpa/$sherpa_archive.part" -w '%{http_code}' "$sherpa_url")" \
+    || die "could not download $sherpa_url"
+  log "HTTP $sherpa_status, $(wc -c < "$STATE_DIR/sherpa/$sherpa_archive.part" | tr -d ' ') bytes"
   bzip2 -t "$STATE_DIR/sherpa/$sherpa_archive.part" || die "sherpa archive is not valid bzip2"
   mv "$STATE_DIR/sherpa/$sherpa_archive.part" "$STATE_DIR/sherpa/$sherpa_archive"
 fi
